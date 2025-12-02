@@ -57,9 +57,8 @@ app.post("/webhook", (req, res) => {
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "🎉 WELCOME TO SHAREGRACE MEDIA BOT!\n\n" +
-    "Send audio/video files or search the channel.\n" +
-    "You can also *tag me on any message in the group* to save it to the storage channel!"
+    "🎉 WELCOME TO SHAREGRACE MEDIA BOT!\n\n"
+
   );
 });
 
@@ -130,27 +129,35 @@ bot.on("message", async (msg) => {
     if (msg.video) return await handleMedia("sendVideo", msg.video.file_id, msg.video.file_name || "untitled");
     if (msg.audio) return await handleMedia("sendAudio", msg.audio.file_id, msg.audio.file_name || "untitled");
 
-    // Search functionality
-    if (msg.text) {
-      const query = msg.text.trim().toLowerCase();
+// PRIVATE CHAT SEARCH FUNCTION
+if (msg.text) {
+  const query = msg.text.trim().toLowerCase();
 
-      const results = Object.values(messageStore).filter((m) =>
-        m.caption.toLowerCase().includes(query)
-      );
+  const results = Object.values(messageStore).filter((m) => {
+    // Split caption into words, remove punctuation
+    const words = (m.caption || "")
+      .toLowerCase()
+      .replace(/[^\w\s]/g, "")
+      .split(/\s+/);
+    return words.includes(query); // Match whole word
+  });
 
-      if (results.length === 0) {
-        return bot.sendMessage(chatId, `❌ No files found matching "${msg.text}".`);
-      }
+  if (results.length === 0) {
+    return bot.sendMessage(chatId, `❌ No files found matching "${msg.text}".`);
+  }
 
-      const keyboard = results.map((m) => [ {
-        text: m.caption.length > 50 ? m.caption.slice(0,50)+"…" : m.caption,
-        callback_data: `${m.chatId}|${m.messageId}`,
-      } ]);
+  const keyboard = results.map((m) => [
+    {
+      text: m.caption.length > 50 ? m.caption.slice(0, 50) + "…" : m.caption,
+      callback_data: `${m.chatId}|${m.messageId}`,
+    },
+  ]);
 
-      bot.sendMessage(chatId, `🔎 Search results for "${msg.text}":`, {
-        reply_markup: { inline_keyboard: keyboard }
-      });
-    }
+  bot.sendMessage(chatId, `🔎 Search results for "${msg.text}":`, {
+    reply_markup: { inline_keyboard: keyboard },
+  });
+}
+
   }
 });
 
