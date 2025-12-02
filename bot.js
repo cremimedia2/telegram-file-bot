@@ -12,7 +12,7 @@ if (!TOKEN || !URL) {
 }
 
 // === CONSTANT CHANNEL ID ===
-const CHANNEL_ID = -1003155277985; // Replace with your channel numeric ID
+const CHANNEL_ID = -1003155277985;
 
 // === INIT BOT ===
 const bot = new TelegramBot(TOKEN);
@@ -23,7 +23,7 @@ const app = express();
 app.use(express.json());
 
 // === MESSAGE STORE ===
-// In-memory store: { messageId: { chatId, messageId, caption, files } }
+// messageStore[messageId] = { chatId, messageId, caption, files }
 const messageStore = {};
 
 // === TELEGRAM WEBHOOK ===
@@ -40,17 +40,32 @@ bot.onText(/\/start/, (msg) => {
   );
 });
 
-// === FUNCTION TO STORE MESSAGE INFO ===
+// === STORE MESSAGE FUNCTION ===
 const storeMessage = (msg) => {
   if (!msg.message_id || !msg.chat) return;
 
   const files = [];
+
   if (msg.document)
-    files.push({ type: "document", file_id: msg.document.file_id, name: msg.document.file_name });
+    files.push({
+      type: "document",
+      file_id: msg.document.file_id,
+      name: msg.document.file_name
+    });
+
   if (msg.video)
-    files.push({ type: "video", file_id: msg.video.file_id, name: msg.video.file_name || "video" });
+    files.push({
+      type: "video",
+      file_id: msg.video.file_id,
+      name: msg.video.file_name || "video"
+    });
+
   if (msg.audio)
-    files.push({ type: "audio", file_id: msg.audio.file_id, name: msg.audio.file_name || "audio" });
+    files.push({
+      type: "audio",
+      file_id: msg.audio.file_id,
+      name: msg.audio.file_name || "audio"
+    });
 
   const caption = msg.caption || msg.text || "";
 
@@ -60,37 +75,51 @@ const storeMessage = (msg) => {
     caption,
     files,
   };
+
+  console.log("Indexed:", caption);
 };
 
-// === HANDLE MEDIA UPLOAD AND SEARCH ===
+// === MAIN MESSAGE HANDLER ===
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
 
-  // Ignore bot commands
+  // Ignore commands
   if (msg.text && msg.text.startsWith("/")) return;
 
-  // === STORE CHANNEL MESSAGES ===
-  if (msg.chat.id === CHANNEL_ID) {
+  // ======================================
+  // 1️⃣ INDEX NEW FILES POSTED IN CHANNEL
+  // ======================================
+  if (chatId === CHANNEL_ID) {
     storeMessage(msg);
-    return; // Do not forward channel messages again
+    return; // stop here (do not forward again)
   }
 
-  // === FORWARD MEDIA TO CHANNEL ===
+  // ======================================
+  // 2️⃣ USER UPLOADS MEDIA TO THE BOT
+  // BOT WILL FORWARD TO THE CHANNEL
+  // ======================================
   const handleMedia = async (type, fileId, title) => {
-    const sentMessage = await bot[type](CHANNEL_ID, fileId, { caption: title });
-    storeMessage(sentMessage);
+    const sent = await bot[type](CHANNEL_ID, fileId, { caption: title });
+    storeMessage(sent);
+
     bot.sendMessage(chatId, `✅ ${type.replace("send", "")} "${title}" uploaded to the channel!`);
   };
 
-  if (msg.document) await handleMedia("sendDocument", msg.document.file_id, msg.document.file_name || "untitled");
-  if (msg.video) await handleMedia("sendVideo", msg.video.file_id, msg.video.file_name || "untitled");
-  if (msg.audio) await handleMedia("sendAudio", msg.audio.file_id, msg.audio.file_name || "untitled");
+  if (msg.document)
+    await handleMedia("sendDocument", msg.document.file_id, msg.document.file_name || "untitled");
 
-  // === SEARCH FUNCTIONALITY ===
-  if (msg.text && !msg.text.startsWith("/")) {
+  if (msg.video)
+    await handleMedia("sendVideo", msg.video.file_id, msg.video.file_name || "untitled");
+
+  if (msg.audio)
+    await handleMedia("sendAudio", msg.audio.file_id, msg.audio.file_name || "untitled");
+
+  // ======================================
+  // 3️⃣ SEARCH FUNCTIONALITY
+  // ======================================
+  if (msg.text) {
     const query = msg.text.trim().toLowerCase();
 
-    // Find all messages where the caption includes the query
     const results = Object.values(messageStore).filter((m) =>
       m.caption.toLowerCase().includes(query)
     );
@@ -100,7 +129,6 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    // Build inline keyboard (max 50 chars)
     const keyboard = results.map((m) => [{
       text: m.caption.length > 50 ? m.caption.slice(0, 50) + "…" : m.caption,
       callback_data: `${m.chatId}|${m.messageId}`
@@ -112,11 +140,10 @@ bot.on("message", async (msg) => {
   }
 });
 
-// === HANDLE INLINE BUTTONS ===
-bot.on("callback_query", async (callbackQuery) => {
-  const chatId = callbackQuery.message.chat.id;
-  const data = callbackQuery.data.split("|");
-  const messageId = parseInt(data[1]);
+// === INLINE BUTTON HANDLER ===
+bot.on("callback_query", async (cb) => {
+  const chatId = cb.message.chat.id;
+  const [sourceChat, messageId] = cb.data.split("|");
 
   const msg = messageStore[messageId];
   if (!msg) {
@@ -126,18 +153,23 @@ bot.on("callback_query", async (callbackQuery) => {
 
   // Send all attached files
   for (const file of msg.files) {
-    if (file.type === "document") await bot.sendDocument(chatId, file.file_id, { caption: file.name });
-    if (file.type === "video") await bot.sendVideo(chatId, file.file_id, { caption: file.name });
-    if (file.type === "audio") await bot.sendAudio(chatId, file.file_id, { caption: file.name });
+    if (file.type === "document")
+      await bot.sendDocument(chatId, file.file_id, { caption: file.name });
+
+    if (file.type === "video")
+      await bot.sendVideo(chatId, file.file_id, { caption: file.name });
+
+    if (file.type === "audio")
+      await bot.sendAudio(chatId, file.file_id, { caption: file.name });
   }
 
-  // Send text/caption if any
+  // Send caption
   if (msg.caption) {
     bot.sendMessage(chatId, `📝 ${msg.caption}`);
   }
 });
 
-// === START EXPRESS SERVER ===
+// === START SERVER ===
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 Bot webhook set to ${URL}/webhook`);
