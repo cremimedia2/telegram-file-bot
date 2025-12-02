@@ -3,8 +3,8 @@ import TelegramBot from "node-telegram-bot-api";
 
 // === CONFIGURATION ===
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const URL = process.env.APP_URL; // Render app URL
-const CHANNEL = "@yourchannelusername"; // Or numeric ID
+const URL = process.env.APP_URL; // Render app URL, e.g., https://your-app.onrender.com
+const CHANNEL = "@yourchannelusername"; // Your channel username or numeric ID
 const PORT = process.env.PORT || 3000;
 
 if (!TOKEN || !URL || !CHANNEL) {
@@ -20,8 +20,8 @@ bot.setWebHook(`${URL}/webhook`);
 const app = express();
 app.use(express.json());
 
-// === STORE MESSAGES ===
-// In-memory: { title -> { chatId, messageId, type } }
+// === MESSAGE STORE ===
+// In-memory store: { messageId: { chatId, messageId, text/caption, files } }
 const messageStore = {};
 
 // === TELEGRAM WEBHOOK ===
@@ -38,27 +38,36 @@ bot.onText(/\/start/, (msg) => {
   );
 });
 
-// === RECEIVE FILES AND STORE ===
+// === FUNCTION TO STORE MESSAGE INFO ===
+const storeMessage = (msg) => {
+  if (!msg.message_id || !msg.chat) return;
+
+  const files = [];
+  if (msg.document) files.push({ type: "document", file_id: msg.document.file_id, name: msg.document.file_name });
+  if (msg.video) files.push({ type: "video", file_id: msg.video.file_id, name: msg.video.file_name || "video" });
+  if (msg.audio) files.push({ type: "audio", file_id: msg.audio.file_id, name: msg.audio.file_name || "audio" });
+
+  const caption = msg.caption || msg.text || "";
+
+  messageStore[msg.message_id] = {
+    chatId: msg.chat.id,
+    messageId: msg.message_id,
+    caption,
+    files
+  };
+};
+
+// === RECEIVE FILES FROM USERS AND STORE ===
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
 
   // Ignore commands
   if (msg.text && msg.text.startsWith("/")) return;
 
-  // Forward media to the channel and store the channel messageId
+  // Forward media to the channel and store the channel message
   const handleMedia = async (type, fileId, title) => {
-    const sentMessage = await bot[type](CHANNEL, fileId, {
-      caption: title,
-    });
-
-    // Store message info for search
-    messageStore[title.toLowerCase()] = {
-      chatId: sentMessage.chat.id,
-      messageId: sentMessage.message_id,
-      type: type,
-      caption: title,
-    };
-
+    const sentMessage = await bot[type](CHANNEL, fileId, { caption: title });
+    storeMessage(sentMessage);
     bot.sendMessage(chatId, `✅ ${type} "${title}" uploaded to the channel!`);
   };
 
@@ -67,19 +76,23 @@ bot.on("message", async (msg) => {
   if (msg.audio) await handleMedia("sendAudio", msg.audio.file_id, msg.audio.file_name || "untitled");
 
   // === SEARCH FUNCTIONALITY ===
-  if (msg.text) {
+  if (msg.text && !msg.text.startsWith("/")) {
     const query = msg.text.toLowerCase();
-    const results = Object.entries(messageStore).filter(([title]) => title.includes(query));
+
+    // Find all messages containing the query in caption/text
+    const results = Object.values(messageStore).filter((m) =>
+      m.caption.toLowerCase().includes(query)
+    );
 
     if (results.length === 0) {
       bot.sendMessage(chatId, `❌ No files found matching "${msg.text}".`);
       return;
     }
 
-    // Build inline keyboard with results
-    const keyboard = results.map(([title, info]) => [{
-      text: title,
-      callback_data: `${info.chatId}|${info.messageId}`
+    // Build inline keyboard with previews (max 50 chars)
+    const keyboard = results.map((m) => [{
+      text: m.caption.length > 50 ? m.caption.slice(0, 50) + "…" : m.caption,
+      callback_data: `${m.chatId}|${m.messageId}`
     }]);
 
     bot.sendMessage(chatId, `🔎 Search results for "${msg.text}":`, {
@@ -95,10 +108,26 @@ bot.on("callback_query", async (callbackQuery) => {
   const channelId = parseInt(data[0]);
   const messageId = parseInt(data[1]);
 
-  // Forward the original channel message to the user
-  await bot.forwardMessage(chatId, channelId, messageId);
+  // Get message from store
+  const msg = messageStore[messageId];
+  if (!msg) {
+    bot.sendMessage(chatId, "❌ Message not found or not indexed.");
+    return;
+  }
+
+  // Send all attached files
+  for (const file of msg.files) {
+    if (file.type === "document") await bot.sendDocument(chatId, file.file_id, { caption: file.name });
+    if (file.type === "video") await bot.sendVideo(chatId, file.file_id, { caption: file.name });
+    if (file.type === "audio") await bot.sendAudio(chatId, file.file_id, { caption: file.name });
+  }
+
+  // Send text/caption if any
+  if (msg.caption) {
+    bot.sendMessage(chatId, `📝 ${msg.caption}`);
+  }
 });
- 
+
 // === START EXPRESS SERVER ===
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
