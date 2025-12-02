@@ -3,16 +3,16 @@ import TelegramBot from "node-telegram-bot-api";
 
 // === CONFIGURATION ===
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const URL = process.env.APP_URL; // e.g., https://your-app.onrender.com
+const URL = process.env.APP_URL;
 const PORT = process.env.PORT || 3000;
 
 if (!TOKEN || !URL) {
-  console.error("Error: TELEGRAM_BOT_TOKEN or APP_URL is not set.");
+  console.error("❌ Error: TELEGRAM_BOT_TOKEN or APP_URL is missing.");
   process.exit(1);
 }
 
-// === CONSTANT CHANNEL ID ===
-const CHANNEL_ID = -1003155277985;
+// === CHANNEL ID ===
+const CHANNEL_ID = -1003155277985; // Your channel ID
 
 // === INIT BOT ===
 const bot = new TelegramBot(TOKEN);
@@ -26,7 +26,7 @@ app.use(express.json());
 // messageStore[messageId] = { chatId, messageId, caption, files }
 const messageStore = {};
 
-// === TELEGRAM WEBHOOK ===
+// === WEBHOOK HANDLER ===
 app.post("/webhook", (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
@@ -36,13 +36,15 @@ app.post("/webhook", (req, res) => {
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "🎉 WELCOME TO THE SHAREGRACE MEDIA BOT REPOSITORY!\n\nSend an audio or video file, or search for files in the channel!"
+    "🎉 WELCOME TO SHAREGRACE MEDIA BOT!\n\nSend audio/video files or search the channel.\n\nYou can also *tag me on any old message in the channel* to index it!"
   );
 });
 
-// === STORE MESSAGE FUNCTION ===
+// =====================================
+// 📌 UTILITY: STORE MESSAGE IN MEMORY
+// =====================================
 const storeMessage = (msg) => {
-  if (!msg.message_id || !msg.chat) return;
+  if (!msg?.message_id || !msg?.chat) return;
 
   const files = [];
 
@@ -76,10 +78,37 @@ const storeMessage = (msg) => {
     files,
   };
 
-  console.log("Indexed:", caption);
+  console.log("📦 Indexed message:", msg.message_id, caption);
 };
 
-// === MAIN MESSAGE HANDLER ===
+// ==========================================================
+// 1️⃣ TAG BOT ON A MESSAGE TO INDEX OLD FILES
+// ==========================================================
+bot.on("message", async (msg) => {
+  if (
+    msg.chat.id === CHANNEL_ID &&                   // Only inside your channel
+    msg.reply_to_message &&                         // Must be replying to a message
+    msg.entities &&                                 // Must contain entities
+    msg.entities.some((e) => e.type === "mention")  // Must @mention the bot
+  ) {
+    const target = msg.reply_to_message;
+
+    console.log("📌 Bot was tagged. Indexing old message:", target.message_id);
+
+    storeMessage(target);
+
+    await bot.sendMessage(
+      CHANNEL_ID,
+      `✅ Indexed: "${target.caption || target.document?.file_name || "untitled"}"`
+    );
+
+    return;
+  }
+});
+
+// ==========================================================
+// 2️⃣ HANDLE ALL OTHER MESSAGES (UPLOAD & SEARCH)
+// ==========================================================
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
 
@@ -87,35 +116,38 @@ bot.on("message", async (msg) => {
   if (msg.text && msg.text.startsWith("/")) return;
 
   // ======================================
-  // 1️⃣ INDEX NEW FILES POSTED IN CHANNEL
+  // 🟦 AUTO-INDEX NEW FILES FROM CHANNEL
   // ======================================
   if (chatId === CHANNEL_ID) {
     storeMessage(msg);
-    return; // stop here (do not forward again)
+    console.log("📥 New channel upload detected.");
+    return;
   }
 
   // ======================================
-  // 2️⃣ USER UPLOADS MEDIA TO THE BOT
-  // BOT WILL FORWARD TO THE CHANNEL
+  // 🟩 USER SENDS MEDIA TO BOT → FORWARD
   // ======================================
   const handleMedia = async (type, fileId, title) => {
     const sent = await bot[type](CHANNEL_ID, fileId, { caption: title });
     storeMessage(sent);
 
-    bot.sendMessage(chatId, `✅ ${type.replace("send", "")} "${title}" uploaded to the channel!`);
+    await bot.sendMessage(
+      chatId,
+      `✅ ${type.replace("send", "")} "${title}" uploaded to the channel!`
+    );
   };
 
   if (msg.document)
-    await handleMedia("sendDocument", msg.document.file_id, msg.document.file_name || "untitled");
+    return await handleMedia("sendDocument", msg.document.file_id, msg.document.file_name || "untitled");
 
   if (msg.video)
-    await handleMedia("sendVideo", msg.video.file_id, msg.video.file_name || "untitled");
+    return await handleMedia("sendVideo", msg.video.file_id, msg.video.file_name || "untitled");
 
   if (msg.audio)
-    await handleMedia("sendAudio", msg.audio.file_id, msg.audio.file_name || "untitled");
+    return await handleMedia("sendAudio", msg.audio.file_id, msg.audio.file_name || "untitled");
 
   // ======================================
-  // 3️⃣ SEARCH FUNCTIONALITY
+  // 🟥 SEARCH FEATURE
   // ======================================
   if (msg.text) {
     const query = msg.text.trim().toLowerCase();
@@ -125,33 +157,34 @@ bot.on("message", async (msg) => {
     );
 
     if (results.length === 0) {
-      bot.sendMessage(chatId, `❌ No files found matching "${msg.text}".`);
-      return;
+      return bot.sendMessage(chatId, `❌ No files found matching "${msg.text}".`);
     }
 
     const keyboard = results.map((m) => [{
       text: m.caption.length > 50 ? m.caption.slice(0, 50) + "…" : m.caption,
-      callback_data: `${m.chatId}|${m.messageId}`
+      callback_data: `${m.chatId}|${m.messageId}`,
     }]);
 
     bot.sendMessage(chatId, `🔎 Search results for "${msg.text}":`, {
-      reply_markup: { inline_keyboard: keyboard }
+      reply_markup: { inline_keyboard: keyboard },
     });
   }
 });
 
-// === INLINE BUTTON HANDLER ===
+// ==========================================================
+// 3️⃣ WHEN USER SELECTS A SEARCH RESULT
+// ==========================================================
 bot.on("callback_query", async (cb) => {
   const chatId = cb.message.chat.id;
   const [sourceChat, messageId] = cb.data.split("|");
 
   const msg = messageStore[messageId];
+
   if (!msg) {
-    bot.sendMessage(chatId, "❌ Message not found or not indexed.");
-    return;
+    return bot.sendMessage(chatId, "❌ Message not found or not indexed.");
   }
 
-  // Send all attached files
+  // Send files
   for (const file of msg.files) {
     if (file.type === "document")
       await bot.sendDocument(chatId, file.file_id, { caption: file.name });
@@ -163,14 +196,15 @@ bot.on("callback_query", async (cb) => {
       await bot.sendAudio(chatId, file.file_id, { caption: file.name });
   }
 
-  // Send caption
   if (msg.caption) {
     bot.sendMessage(chatId, `📝 ${msg.caption}`);
   }
 });
 
-// === START SERVER ===
+// ==========================================================
+// 🚀 START SERVER
+// ==========================================================
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📡 Bot webhook set to ${URL}/webhook`);
+  console.log(`📡 Webhook set: ${URL}/webhook`);
 });
