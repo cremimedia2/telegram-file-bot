@@ -12,7 +12,7 @@ if (!TOKEN || !URL) {
 }
 
 // === CHANNEL ID ===
-const CHANNEL_ID = -1003155277985; // Your channel ID
+const CHANNEL_ID = -1003155277985;
 
 // === INIT BOT ===
 const bot = new TelegramBot(TOKEN);
@@ -23,7 +23,6 @@ const app = express();
 app.use(express.json());
 
 // === MESSAGE STORE ===
-// messageStore[messageId] = { chatId, messageId, caption, files }
 const messageStore = {};
 
 // === WEBHOOK HANDLER ===
@@ -36,13 +35,11 @@ app.post("/webhook", (req, res) => {
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "🎉 WELCOME TO SHAREGRACE MEDIA BOT!\n\nSend audio/video files or search the channel.\n\nYou can also *tag me on any old message in the channel* to index it!"
+    "🎉 WELCOME TO SHAREGRACE MEDIA BOT!\n\nSend audio/video files or search the channel.\nYou can also *tag me on any message in the channel* to index it!"
   );
 });
 
-// =====================================
-// 📌 UTILITY: STORE MESSAGE IN MEMORY
-// =====================================
+// === STORE MESSAGE FUNCTION ===
 const storeMessage = (msg) => {
   if (!msg?.message_id || !msg?.chat) return;
 
@@ -52,21 +49,21 @@ const storeMessage = (msg) => {
     files.push({
       type: "document",
       file_id: msg.document.file_id,
-      name: msg.document.file_name
+      name: msg.document.file_name,
     });
 
   if (msg.video)
     files.push({
       type: "video",
       file_id: msg.video.file_id,
-      name: msg.video.file_name || "video"
+      name: msg.video.file_name || "video",
     });
 
   if (msg.audio)
     files.push({
       type: "audio",
       file_id: msg.audio.file_id,
-      name: msg.audio.file_name || "audio"
+      name: msg.audio.file_name || "audio",
     });
 
   const caption = msg.caption || msg.text || "";
@@ -82,14 +79,27 @@ const storeMessage = (msg) => {
 };
 
 // ==========================================================
-// 1️⃣ TAG BOT ON A MESSAGE TO INDEX OLD FILES
+// 1️⃣ HANDLE TAGGING BOT ON CHANNEL POST
+// ==========================================================
+bot.on("channel_post", async (msg) => {
+  // Auto-index any new messages in the channel
+  storeMessage(msg);
+  console.log("📥 New channel post indexed:", msg.message_id);
+});
+
+// ==========================================================
+// 2️⃣ HANDLE MENTIONS / REPLY TAGS IN CHANNEL
 // ==========================================================
 bot.on("message", async (msg) => {
   if (
-    msg.chat.id === CHANNEL_ID &&                   // Only inside your channel
-    msg.reply_to_message &&                         // Must be replying to a message
-    msg.entities &&                                 // Must contain entities
-    msg.entities.some((e) => e.type === "mention")  // Must @mention the bot
+    msg.chat.id === CHANNEL_ID &&
+    msg.reply_to_message &&
+    msg.entities &&
+    msg.entities.some(
+      (e) =>
+        e.type === "mention" &&
+        msg.text.includes("@CREMIMEDIA_Bot")
+    )
   ) {
     const target = msg.reply_to_message;
 
@@ -97,17 +107,24 @@ bot.on("message", async (msg) => {
 
     storeMessage(target);
 
-    await bot.sendMessage(
-      CHANNEL_ID,
-      `✅ Indexed: "${target.caption || target.document?.file_name || "untitled"}"`
-    );
+    if (target.document || target.video || target.audio) {
+      await bot.sendMessage(
+        CHANNEL_ID,
+        `✅ "${target.caption || target.document?.file_name || "untitled"}" saved ✔️`
+      );
+    } else {
+      await bot.sendMessage(
+        CHANNEL_ID,
+        `❌ File not recognized. Please retry.`
+      );
+    }
 
     return;
   }
 });
 
 // ==========================================================
-// 2️⃣ HANDLE ALL OTHER MESSAGES (UPLOAD & SEARCH)
+// 3️⃣ HANDLE USER UPLOADS TO BOT → FORWARD TO CHANNEL
 // ==========================================================
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
@@ -115,18 +132,10 @@ bot.on("message", async (msg) => {
   // Ignore commands
   if (msg.text && msg.text.startsWith("/")) return;
 
-  // ======================================
-  // 🟦 AUTO-INDEX NEW FILES FROM CHANNEL
-  // ======================================
-  if (chatId === CHANNEL_ID) {
-    storeMessage(msg);
-    console.log("📥 New channel upload detected.");
-    return;
-  }
+  // Ignore channel messages handled above
+  if (chatId === CHANNEL_ID) return;
 
-  // ======================================
-  // 🟩 USER SENDS MEDIA TO BOT → FORWARD
-  // ======================================
+  // Forward media
   const handleMedia = async (type, fileId, title) => {
     const sent = await bot[type](CHANNEL_ID, fileId, { caption: title });
     storeMessage(sent);
@@ -146,9 +155,7 @@ bot.on("message", async (msg) => {
   if (msg.audio)
     return await handleMedia("sendAudio", msg.audio.file_id, msg.audio.file_name || "untitled");
 
-  // ======================================
-  // 🟥 SEARCH FEATURE
-  // ======================================
+  // Search functionality
   if (msg.text) {
     const query = msg.text.trim().toLowerCase();
 
@@ -172,7 +179,7 @@ bot.on("message", async (msg) => {
 });
 
 // ==========================================================
-// 3️⃣ WHEN USER SELECTS A SEARCH RESULT
+// 4️⃣ HANDLE INLINE CALLBACK
 // ==========================================================
 bot.on("callback_query", async (cb) => {
   const chatId = cb.message.chat.id;
@@ -184,14 +191,11 @@ bot.on("callback_query", async (cb) => {
     return bot.sendMessage(chatId, "❌ Message not found or not indexed.");
   }
 
-  // Send files
   for (const file of msg.files) {
     if (file.type === "document")
       await bot.sendDocument(chatId, file.file_id, { caption: file.name });
-
     if (file.type === "video")
       await bot.sendVideo(chatId, file.file_id, { caption: file.name });
-
     if (file.type === "audio")
       await bot.sendAudio(chatId, file.file_id, { caption: file.name });
   }
@@ -202,7 +206,7 @@ bot.on("callback_query", async (cb) => {
 });
 
 // ==========================================================
-// 🚀 START SERVER
+// 5️⃣ START SERVER
 // ==========================================================
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
