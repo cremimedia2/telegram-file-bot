@@ -11,6 +11,9 @@ if (!TOKEN || !URL) {
   process.exit(1);
 }
 
+// === CONSTANT CHANNEL ID ===
+const CHANNEL_ID = -1003155277985;
+
 // === INIT BOT ===
 const bot = new TelegramBot(TOKEN);
 bot.setWebHook(`${URL}/webhook`);
@@ -20,11 +23,8 @@ const app = express();
 app.use(express.json());
 
 // === MESSAGE STORE ===
-// In-memory store: { messageId: { chatId, messageId, text/caption, files } }
+// In-memory store: { messageId: { chatId, messageId, caption, files } }
 const messageStore = {};
-
-// === CHANNEL ID (fixed) ===
-const CHANNEL_ID = -1003155277985;
 
 // === TELEGRAM WEBHOOK ===
 app.post("/webhook", (req, res) => {
@@ -69,7 +69,7 @@ bot.on("message", async (msg) => {
   // Ignore commands
   if (msg.text && msg.text.startsWith("/")) return;
 
-  // Forward media to the fixed channel and store the channel message
+  // === FORWARD MEDIA TO CHANNEL ===
   const handleMedia = async (type, fileId, title) => {
     const sentMessage = await bot[type](CHANNEL_ID, fileId, { caption: title });
     storeMessage(sentMessage);
@@ -84,7 +84,6 @@ bot.on("message", async (msg) => {
   if (msg.text && !msg.text.startsWith("/")) {
     const query = msg.text.toLowerCase();
 
-    // Find all messages containing the query in caption/text
     const results = Object.values(messageStore).filter((m) =>
       m.caption.toLowerCase().includes(query)
     );
@@ -94,7 +93,7 @@ bot.on("message", async (msg) => {
       return;
     }
 
-    // Build inline keyboard with previews (max 50 chars)
+    // Build inline keyboard (max 50 chars)
     const keyboard = results.map((m) => [{
       text: m.caption.length > 50 ? m.caption.slice(0, 50) + "…" : m.caption,
       callback_data: `${m.chatId}|${m.messageId}`
@@ -112,7 +111,6 @@ bot.on("callback_query", async (callbackQuery) => {
   const data = callbackQuery.data.split("|");
   const messageId = parseInt(data[1]);
 
-  // Get message from store
   const msg = messageStore[messageId];
   if (!msg) {
     bot.sendMessage(chatId, "❌ Message not found or not indexed.");
@@ -136,5 +134,4 @@ bot.on("callback_query", async (callbackQuery) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 Bot webhook set to ${URL}/webhook`);
-  console.log(`📌 Bot will always post to channel ID: ${CHANNEL_ID}`);
 });
