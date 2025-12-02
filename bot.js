@@ -4,11 +4,10 @@ import TelegramBot from "node-telegram-bot-api";
 // === CONFIGURATION ===
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const URL = process.env.APP_URL; // Render app URL, e.g., https://your-app.onrender.com
-const CHANNEL = "@yourchannelusername"; // Your channel username or numeric ID
 const PORT = process.env.PORT || 3000;
 
-if (!TOKEN || !URL || !CHANNEL) {
-  console.error("Error: TELEGRAM_BOT_TOKEN, APP_URL, or CHANNEL is not set.");
+if (!TOKEN || !URL) {
+  console.error("Error: TELEGRAM_BOT_TOKEN or APP_URL is not set.");
   process.exit(1);
 }
 
@@ -23,6 +22,9 @@ app.use(express.json());
 // === MESSAGE STORE ===
 // In-memory store: { messageId: { chatId, messageId, text/caption, files } }
 const messageStore = {};
+
+// === CHANNEL ID (auto-detected) ===
+let CHANNEL_ID = null; // Will be set when the bot receives a message from the channel
 
 // === TELEGRAM WEBHOOK ===
 app.post("/webhook", (req, res) => {
@@ -43,9 +45,12 @@ const storeMessage = (msg) => {
   if (!msg.message_id || !msg.chat) return;
 
   const files = [];
-  if (msg.document) files.push({ type: "document", file_id: msg.document.file_id, name: msg.document.file_name });
-  if (msg.video) files.push({ type: "video", file_id: msg.video.file_id, name: msg.video.file_name || "video" });
-  if (msg.audio) files.push({ type: "audio", file_id: msg.audio.file_id, name: msg.audio.file_name || "audio" });
+  if (msg.document)
+    files.push({ type: "document", file_id: msg.document.file_id, name: msg.document.file_name });
+  if (msg.video)
+    files.push({ type: "video", file_id: msg.video.file_id, name: msg.video.file_name || "video" });
+  if (msg.audio)
+    files.push({ type: "audio", file_id: msg.audio.file_id, name: msg.audio.file_name || "audio" });
 
   const caption = msg.caption || msg.text || "";
 
@@ -53,7 +58,7 @@ const storeMessage = (msg) => {
     chatId: msg.chat.id,
     messageId: msg.message_id,
     caption,
-    files
+    files,
   };
 };
 
@@ -61,12 +66,25 @@ const storeMessage = (msg) => {
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
 
+  // === AUTO-DETECT CHANNEL ID ===
+  // This works only if the message comes from the channel
+  if (msg.chat.type === "channel" && !CHANNEL_ID) {
+    CHANNEL_ID = msg.chat.id;
+    console.log(`✅ Detected channel ID: ${CHANNEL_ID}`);
+    return;
+  }
+
   // Ignore commands
   if (msg.text && msg.text.startsWith("/")) return;
 
+  if (!CHANNEL_ID) {
+    bot.sendMessage(chatId, "⚠️ The channel ID is not detected yet. Send a message from your channel to the bot first.");
+    return;
+  }
+
   // Forward media to the channel and store the channel message
   const handleMedia = async (type, fileId, title) => {
-    const sentMessage = await bot[type](CHANNEL, fileId, { caption: title });
+    const sentMessage = await bot[type](CHANNEL_ID, fileId, { caption: title });
     storeMessage(sentMessage);
     bot.sendMessage(chatId, `✅ ${type} "${title}" uploaded to the channel!`);
   };
@@ -131,4 +149,5 @@ bot.on("callback_query", async (callbackQuery) => {
 // === START EXPRESS SERVER ===
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📡 Bot webhook set to ${URL}/webhook`);
 });
