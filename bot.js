@@ -4,7 +4,7 @@ import TelegramBot from "node-telegram-bot-api";
 // === CONFIGURATION ===
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const URL = process.env.APP_URL; // Render app URL
-const CHANNEL = "@yourchannelusername"; // Or use the numeric channel ID
+const CHANNEL = "@yourchannelusername"; // Or numeric ID
 const PORT = process.env.PORT || 3000;
 
 if (!TOKEN || !URL || !CHANNEL) {
@@ -20,10 +20,11 @@ bot.setWebHook(`${URL}/webhook`);
 const app = express();
 app.use(express.json());
 
-// In-memory store for uploaded files (title -> file_id)
-const fileStore = {};
+// === STORE MESSAGES ===
+// In-memory: { title -> { chatId, messageId, type } }
+const messageStore = {};
 
-// === TELEGRAM WEBHOOK ENDPOINT ===
+// === TELEGRAM WEBHOOK ===
 app.post("/webhook", (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
@@ -37,70 +38,68 @@ bot.onText(/\/start/, (msg) => {
   );
 });
 
-// === RECEIVE FILES ===
+// === RECEIVE FILES AND STORE ===
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
 
-  // Handle documents
-  if (msg.document) {
-    const fileId = msg.document.file_id;
-    const title = msg.document.file_name || "untitled";
+  // Ignore commands
+  if (msg.text && msg.text.startsWith("/")) return;
 
-    // Store file in memory
-    fileStore[title.toLowerCase()] = fileId;
-
-    // Forward file to the channel
-    await bot.sendDocument(CHANNEL, fileId, {
-      caption: `📥 New file uploaded: ${title}`,
+  // Forward media to the channel and store the channel messageId
+  const handleMedia = async (type, fileId, title) => {
+    const sentMessage = await bot[type](CHANNEL, fileId, {
+      caption: title,
     });
 
-    bot.sendMessage(chatId, `✅ File "${title}" has been uploaded to the channel!`);
-  }
+    // Store message info for search
+    messageStore[title.toLowerCase()] = {
+      chatId: sentMessage.chat.id,
+      messageId: sentMessage.message_id,
+      type: type,
+      caption: title,
+    };
 
-  // Handle videos
-  if (msg.video) {
-    const fileId = msg.video.file_id;
-    const title = msg.video.file_name || "untitled";
+    bot.sendMessage(chatId, `✅ ${type} "${title}" uploaded to the channel!`);
+  };
 
-    fileStore[title.toLowerCase()] = fileId;
+  if (msg.document) await handleMedia("sendDocument", msg.document.file_id, msg.document.file_name || "untitled");
+  if (msg.video) await handleMedia("sendVideo", msg.video.file_id, msg.video.file_name || "untitled");
+  if (msg.audio) await handleMedia("sendAudio", msg.audio.file_id, msg.audio.file_name || "untitled");
 
-    await bot.sendVideo(CHANNEL, fileId, {
-      caption: `📥 New video uploaded: ${title}`,
-    });
-
-    bot.sendMessage(chatId, `✅ Video "${title}" has been uploaded to the channel!`);
-  }
-
-  // Handle audio
-  if (msg.audio) {
-    const fileId = msg.audio.file_id;
-    const title = msg.audio.file_name || "untitled";
-
-    fileStore[title.toLowerCase()] = fileId;
-
-    await bot.sendAudio(CHANNEL, fileId, {
-      caption: `📥 New audio uploaded: ${title}`,
-    });
-
-    bot.sendMessage(chatId, `✅ Audio "${title}" has been uploaded to the channel!`);
-  }
-
-  // Handle search query
-  if (msg.text && !msg.text.startsWith("/")) {
+  // === SEARCH FUNCTIONALITY ===
+  if (msg.text) {
     const query = msg.text.toLowerCase();
-    const resultFileId = fileStore[query];
+    const results = Object.entries(messageStore).filter(([title]) => title.includes(query));
 
-    if (resultFileId) {
-      bot.sendDocument(chatId, resultFileId, {
-        caption: `📁 Here is the file you searched for: ${msg.text}`,
-      });
-    } else {
-      bot.sendMessage(chatId, `❌ Sorry, no file found with the title "${msg.text}".`);
+    if (results.length === 0) {
+      bot.sendMessage(chatId, `❌ No files found matching "${msg.text}".`);
+      return;
     }
+
+    // Build inline keyboard with results
+    const keyboard = results.map(([title, info]) => [{
+      text: title,
+      callback_data: `${info.chatId}|${info.messageId}`
+    }]);
+
+    bot.sendMessage(chatId, `🔎 Search results for "${msg.text}":`, {
+      reply_markup: { inline_keyboard: keyboard }
+    });
   }
 });
 
+// === HANDLE INLINE BUTTONS ===
+bot.on("callback_query", async (callbackQuery) => {
+  const chatId = callbackQuery.message.chat.id;
+  const data = callbackQuery.data.split("|");
+  const channelId = parseInt(data[0]);
+  const messageId = parseInt(data[1]);
+
+  // Forward the original channel message to the user
+  await bot.forwardMessage(chatId, channelId, messageId);
+});
+ 
 // === START EXPRESS SERVER ===
 app.listen(PORT, () => {
-  console.log(`🚀 Server is running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
