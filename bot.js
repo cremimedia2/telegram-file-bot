@@ -3,7 +3,7 @@ import TelegramBot from "node-telegram-bot-api";
 
 // === CONFIGURATION ===
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const URL = process.env.APP_URL; // Render app URL, e.g., https://your-app.onrender.com
+const URL = process.env.APP_URL; // e.g., https://your-app.onrender.com
 const PORT = process.env.PORT || 3000;
 
 if (!TOKEN || !URL) {
@@ -12,7 +12,7 @@ if (!TOKEN || !URL) {
 }
 
 // === CONSTANT CHANNEL ID ===
-const CHANNEL_ID = -1003155277985; // Your channel numeric ID
+const CHANNEL_ID = -1003155277985; // Replace with your channel numeric ID
 
 // === INIT BOT ===
 const bot = new TelegramBot(TOKEN);
@@ -36,7 +36,7 @@ app.post("/webhook", (req, res) => {
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "🎉 WELCOME TO THE SHAREGRACE MEDIA BOT REPOSITORY!\n\nWhich audio or video file would you like to get?"
+    "🎉 WELCOME TO THE SHAREGRACE MEDIA BOT REPOSITORY!\n\nSend an audio or video file, or search for files in the channel!"
   );
 });
 
@@ -66,22 +66,19 @@ const storeMessage = (msg) => {
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
 
-  // Ignore commands
+  // Ignore bot commands
   if (msg.text && msg.text.startsWith("/")) return;
+
+  // === STORE CHANNEL MESSAGES ===
+  if (msg.chat.id === CHANNEL_ID) {
+    storeMessage(msg);
+    return; // Do not forward channel messages again
+  }
 
   // === FORWARD MEDIA TO CHANNEL ===
   const handleMedia = async (type, fileId, title) => {
-    // Send media to the channel
     const sentMessage = await bot[type](CHANNEL_ID, fileId, { caption: title });
-
-    // Store the sent message for search
-    messageStore[sentMessage.message_id] = {
-      chatId: CHANNEL_ID,
-      messageId: sentMessage.message_id,
-      caption: title,
-      files: [{ type: type.replace("send", "").toLowerCase(), file_id: fileId, name: title }],
-    };
-
+    storeMessage(sentMessage);
     bot.sendMessage(chatId, `✅ ${type.replace("send", "")} "${title}" uploaded to the channel!`);
   };
 
@@ -90,29 +87,18 @@ bot.on("message", async (msg) => {
   if (msg.audio) await handleMedia("sendAudio", msg.audio.file_id, msg.audio.file_name || "untitled");
 
   // === SEARCH FUNCTIONALITY ===
-if (msg.text && !msg.text.startsWith("/")) {
-  const query = msg.text.trim().toLowerCase(); // trim spaces & lowercase
+  if (msg.text && !msg.text.startsWith("/")) {
+    const query = msg.text.trim().toLowerCase();
 
-  // Filter messages where the caption includes the query anywhere
-  const results = Object.values(messageStore).filter((m) =>
-    m.caption.toLowerCase().includes(query)
-  );
+    // Find all messages where the caption includes the query
+    const results = Object.values(messageStore).filter((m) =>
+      m.caption.toLowerCase().includes(query)
+    );
 
-  if (results.length === 0) {
-    bot.sendMessage(chatId, `❌ No files found matching "${msg.text}".`);
-    return;
-  }
-
-  // Build inline keyboard (max 50 chars)
-  const keyboard = results.map((m) => [{
-    text: m.caption.length > 50 ? m.caption.slice(0, 50) + "…" : m.caption,
-    callback_data: `${m.chatId}|${m.messageId}`
-  }]);
-
-  bot.sendMessage(chatId, `🔎 Search results for "${msg.text}":`, {
-    reply_markup: { inline_keyboard: keyboard }
-  });
-}
+    if (results.length === 0) {
+      bot.sendMessage(chatId, `❌ No files found matching "${msg.text}".`);
+      return;
+    }
 
     // Build inline keyboard (max 50 chars)
     const keyboard = results.map((m) => [{
