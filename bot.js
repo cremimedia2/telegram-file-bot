@@ -90,17 +90,29 @@ bot.on("message", async (msg) => {
   if (msg.audio) await handleMedia("sendAudio", msg.audio.file_id, msg.audio.file_name || "untitled");
 
   // === SEARCH FUNCTIONALITY ===
-  if (msg.text && !msg.text.startsWith("/")) {
-    const query = msg.text.toLowerCase();
+if (msg.text && !msg.text.startsWith("/")) {
+  const query = msg.text.trim().toLowerCase(); // trim spaces & lowercase
 
-    const results = Object.values(messageStore).filter((m) =>
-      m.caption.toLowerCase().includes(query)
-    );
+  // Filter messages where the caption includes the query anywhere
+  const results = Object.values(messageStore).filter((m) =>
+    m.caption.toLowerCase().includes(query)
+  );
 
-    if (results.length === 0) {
-      bot.sendMessage(chatId, `❌ No files found matching "${msg.text}".`);
-      return;
-    }
+  if (results.length === 0) {
+    bot.sendMessage(chatId, `❌ No files found matching "${msg.text}".`);
+    return;
+  }
+
+  // Build inline keyboard (max 50 chars)
+  const keyboard = results.map((m) => [{
+    text: m.caption.length > 50 ? m.caption.slice(0, 50) + "…" : m.caption,
+    callback_data: `${m.chatId}|${m.messageId}`
+  }]);
+
+  bot.sendMessage(chatId, `🔎 Search results for "${msg.text}":`, {
+    reply_markup: { inline_keyboard: keyboard }
+  });
+}
 
     // Build inline keyboard (max 50 chars)
     const keyboard = results.map((m) => [{
