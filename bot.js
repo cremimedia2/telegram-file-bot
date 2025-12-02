@@ -32,6 +32,12 @@ app.post("/webhook", (req, res) => {
   res.sendStatus(200);
 });
 
+test run 
+bot.on("message", (msg) => {
+  if (msg.chat.type === "channel") {
+    console.log("Channel ID:", msg.chat.id);
+  }
+});
 // === WELCOME MESSAGE ===
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
