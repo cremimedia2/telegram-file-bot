@@ -1,1 +1,14 @@
+{
+  "name": "cremi-media-bot",
+  "version": "1.0.0",
+  "main": "src/bot.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/bot.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.2",
+    "dotenv": "^16.4.0"
+  }
+}
 
