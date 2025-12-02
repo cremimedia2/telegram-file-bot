@@ -12,7 +12,7 @@ if (!TOKEN || !URL) {
 }
 
 // === CONSTANT CHANNEL ID ===
-const CHANNEL_ID = -1003155277985;
+const CHANNEL_ID = -1003155277985; // Your channel numeric ID
 
 // === INIT BOT ===
 const bot = new TelegramBot(TOKEN);
@@ -62,7 +62,7 @@ const storeMessage = (msg) => {
   };
 };
 
-// === RECEIVE FILES FROM USERS AND STORE ===
+// === HANDLE MEDIA UPLOAD AND SEARCH ===
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
 
@@ -71,9 +71,18 @@ bot.on("message", async (msg) => {
 
   // === FORWARD MEDIA TO CHANNEL ===
   const handleMedia = async (type, fileId, title) => {
+    // Send media to the channel
     const sentMessage = await bot[type](CHANNEL_ID, fileId, { caption: title });
-    storeMessage(sentMessage);
-    bot.sendMessage(chatId, `✅ ${type} "${title}" uploaded to the channel!`);
+
+    // Store the sent message for search
+    messageStore[sentMessage.message_id] = {
+      chatId: CHANNEL_ID,
+      messageId: sentMessage.message_id,
+      caption: title,
+      files: [{ type: type.replace("send", "").toLowerCase(), file_id: fileId, name: title }],
+    };
+
+    bot.sendMessage(chatId, `✅ ${type.replace("send", "")} "${title}" uploaded to the channel!`);
   };
 
   if (msg.document) await handleMedia("sendDocument", msg.document.file_id, msg.document.file_name || "untitled");
