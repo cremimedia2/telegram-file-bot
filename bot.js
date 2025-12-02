@@ -23,8 +23,8 @@ app.use(express.json());
 // In-memory store: { messageId: { chatId, messageId, text/caption, files } }
 const messageStore = {};
 
-// === CHANNEL ID (auto-detected) ===
-let CHANNEL_ID = null; // Will be set when the bot receives a message from the channel
+// === CHANNEL ID (fixed) ===
+const CHANNEL_ID = -1003155277985;
 
 // === TELEGRAM WEBHOOK ===
 app.post("/webhook", (req, res) => {
@@ -32,12 +32,6 @@ app.post("/webhook", (req, res) => {
   res.sendStatus(200);
 });
 
-test run 
-bot.on("message", (msg) => {
-  if (msg.chat.type === "channel") {
-    console.log("Channel ID:", msg.chat.id);
-  }
-});
 // === WELCOME MESSAGE ===
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
@@ -72,23 +66,10 @@ const storeMessage = (msg) => {
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
 
-  // === AUTO-DETECT CHANNEL ID ===
-  // This works only if the message comes from the channel
-  if (msg.chat.type === "channel" && !CHANNEL_ID) {
-    CHANNEL_ID = msg.chat.id;
-    console.log(`✅ Detected channel ID: ${CHANNEL_ID}`);
-    return;
-  }
-
   // Ignore commands
   if (msg.text && msg.text.startsWith("/")) return;
 
-  if (!CHANNEL_ID) {
-    bot.sendMessage(chatId, "⚠️ The channel ID is not detected yet. Send a message from your channel to the bot first.");
-    return;
-  }
-
-  // Forward media to the channel and store the channel message
+  // Forward media to the fixed channel and store the channel message
   const handleMedia = async (type, fileId, title) => {
     const sentMessage = await bot[type](CHANNEL_ID, fileId, { caption: title });
     storeMessage(sentMessage);
@@ -129,7 +110,6 @@ bot.on("message", async (msg) => {
 bot.on("callback_query", async (callbackQuery) => {
   const chatId = callbackQuery.message.chat.id;
   const data = callbackQuery.data.split("|");
-  const channelId = parseInt(data[0]);
   const messageId = parseInt(data[1]);
 
   // Get message from store
@@ -156,4 +136,5 @@ bot.on("callback_query", async (callbackQuery) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 Bot webhook set to ${URL}/webhook`);
+  console.log(`📌 Bot will always post to channel ID: ${CHANNEL_ID}`);
 });
