@@ -11,8 +11,9 @@ if (!TOKEN || !URL) {
   process.exit(1);
 }
 
-// === STORAGE CHANNEL ID ===
-const CHANNEL_ID = -1003155277985;
+// === CHANNEL & GROUP CONFIG ===
+const STORAGE_CHANNEL_ID = -1003155277985; // Channel for storing files
+const ALLOWED_FILE_TYPES = ["document", "audio", "video"]; // Only index these
 
 // === INIT BOT ===
 const bot = new TelegramBot(TOKEN);
@@ -23,17 +24,20 @@ const app = express();
 app.use(express.json());
 
 // === MESSAGE STORE ===
-// messageId -> { chatId, messageId, caption, files }
-const messageStore = {};
+const messageStore = {}; // messageId -> { chatId, messageId, caption, files }
 
 // === STORE MESSAGE FUNCTION ===
 const storeMessage = (msg) => {
   if (!msg?.message_id || !msg?.chat) return;
 
   const files = [];
+
   if (msg.document) files.push({ type: "document", file_id: msg.document.file_id, name: msg.document.file_name });
   if (msg.video) files.push({ type: "video", file_id: msg.video.file_id, name: msg.video.file_name || "video" });
   if (msg.audio) files.push({ type: "audio", file_id: msg.audio.file_id, name: msg.audio.file_name || "audio" });
+
+  // Only store if it has allowed file types
+  if (files.length === 0) return;
 
   const caption = msg.caption || msg.text || "";
 
@@ -57,31 +61,27 @@ app.post("/webhook", (req, res) => {
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "🎉 WELCOME TO SHAREGRACE MEDIA BOT!\n\nSend audio/video files or search the channel/group.\n\nYou can also *tag me on a file in the group* to save it!"
+    "🎉 WELCOME TO SHAREGRACE MEDIA BOT!\n\nSend audio/video files here or search the group/channel.\n\nReply to a file in the group and tag me to save it!"
   );
 });
 
 // ==========================================================
-// 1️⃣ INDEX GROUP FILES AND TAGGING HANDLER
+// 1️⃣ GROUP MEDIA INDEXING & TAGGING
 // ==========================================================
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
 
-  // Ignore bot commands
+  // Ignore commands
   if (msg.text && msg.text.startsWith("/")) return;
 
   // -----------------------------
   // ✅ Group messages
   // -----------------------------
-  if (msg.chat.type.includes("group") && chatId !== CHANNEL_ID) {
+  if (msg.chat.type.includes("group")) {
+    // 1️⃣ Auto-index allowed files
+    if (msg.document || msg.video || msg.audio) storeMessage(msg);
 
-    // 1️⃣ Auto-index media
-    if (msg.document || msg.video || msg.audio) {
-      storeMessage(msg);
-      console.log("📥 Group file indexed:", msg.message_id);
-    }
-
-    // 2️⃣ Tag bot to save & forward a file
+    // 2️⃣ Tag bot to save & forward
     if (
       msg.reply_to_message &&
       msg.entities?.some(e => e.type === "mention" && msg.text.includes("@CREMIMEDIA_Bot"))
@@ -90,9 +90,10 @@ bot.on("message", async (msg) => {
 
       if (target.document || target.video || target.audio) {
         try {
-          if (target.document) await bot.sendDocument(CHANNEL_ID, target.document.file_id, { caption: target.document.file_name });
-          if (target.video) await bot.sendVideo(CHANNEL_ID, target.video.file_id, { caption: target.video.file_name || "video" });
-          if (target.audio) await bot.sendAudio(CHANNEL_ID, target.audio.file_id, { caption: target.audio.file_name || "audio" });
+          // Forward to storage channel
+          if (target.document) await bot.sendDocument(STORAGE_CHANNEL_ID, target.document.file_id, { caption: target.document.file_name });
+          if (target.video) await bot.sendVideo(STORAGE_CHANNEL_ID, target.video.file_id, { caption: target.video.file_name || "video" });
+          if (target.audio) await bot.sendAudio(STORAGE_CHANNEL_ID, target.audio.file_id, { caption: target.audio.file_name || "audio" });
 
           storeMessage(target);
 
@@ -107,38 +108,37 @@ bot.on("message", async (msg) => {
       }
     }
 
-    return; // Stop processing further for group
+    return; // stop processing further for group
   }
 
   // -----------------------------
-  // ✅ Private chat: upload/search
+  // ✅ Private chat
   // -----------------------------
   if (msg.chat.type === "private") {
 
-    // 1️⃣ Forward uploaded media to storage channel
+    // 1️⃣ Forward uploaded media to storage channel + group
     const handleMedia = async (type, fileId, title) => {
-      const sent = await bot[type](CHANNEL_ID, fileId, { caption: title });
-      storeMessage(sent);
-
-      await bot.sendMessage(msg.chat.id, `✅ ${type.replace("send", "")} "${title}" uploaded to the channel!`);
+      try {
+        const sentToChannel = await bot[type](STORAGE_CHANNEL_ID, fileId, { caption: title });
+        storeMessage(sentToChannel);
+        await bot.sendMessage(msg.chat.id, `✅ ${type.replace("send", "")} "${title}" uploaded to the channel!`);
+      } catch (err) {
+        console.error("❌ Error forwarding media:", err);
+        await bot.sendMessage(msg.chat.id, `❌ Failed to upload "${title}".`);
+      }
     };
 
     if (msg.document) return await handleMedia("sendDocument", msg.document.file_id, msg.document.file_name || "untitled");
     if (msg.video) return await handleMedia("sendVideo", msg.video.file_id, msg.video.file_name || "untitled");
     if (msg.audio) return await handleMedia("sendAudio", msg.audio.file_id, msg.audio.file_name || "untitled");
 
-    // 2️⃣ Search in private chat (partial match)
+    // 2️⃣ Search (partial word match)
     if (msg.text) {
       const query = msg.text.trim().toLowerCase();
 
-      const results = Object.values(messageStore).filter((m) => {
-        const caption = m.caption.toLowerCase();
-        return caption.includes(query); // Partial match anywhere in the caption
-      });
+      const results = Object.values(messageStore).filter((m) => (m.caption || "").toLowerCase().includes(query));
 
-      if (results.length === 0) {
-        return bot.sendMessage(chatId, `❌ No files found matching "${msg.text}".`);
-      }
+      if (results.length === 0) return bot.sendMessage(chatId, `❌ No files found matching "${msg.text}".`);
 
       const keyboard = results.map((m) => [
         { text: m.caption.length > 50 ? m.caption.slice(0, 50) + "…" : m.caption, callback_data: `${m.chatId}|${m.messageId}` },
