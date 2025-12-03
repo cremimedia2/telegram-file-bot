@@ -1,236 +1,191 @@
 import express from "express";
 import TelegramBot from "node-telegram-bot-api";
 import pkg from "pg";
+const { Pool } = pkg;
 
-const { Client } = pkg;
-
-// === CONFIGURATION ===
+// ================== CONFIG ==================
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const URL = process.env.APP_URL;
 const PORT = process.env.PORT || 3000;
+const DATABASE_URL = process.env.DATABASE_URL; // Aiven Postgres
+const CHANNEL_ID = -1003155277985; // Your storage channel
 
-if (!TOKEN || !URL) {
-  console.error("❌ Error: TELEGRAM_BOT_TOKEN or APP_URL is missing.");
+if (!TOKEN || !URL || !DATABASE_URL) {
+  console.error("❌ Missing required environment variables.");
   process.exit(1);
 }
 
-// === STORAGE CHANNEL ID ===
-const CHANNEL_ID = -1003155277985;
+// ================== POSTGRES ==================
+const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
-// === INIT BOT ===
+// Initialize DB table
+await pool.query(`
+CREATE TABLE IF NOT EXISTS files (
+    id SERIAL PRIMARY KEY,
+    chat_id BIGINT NOT NULL,
+    message_id BIGINT NOT NULL,
+    caption TEXT NOT NULL,
+    file_type TEXT NOT NULL,
+    file_id TEXT NOT NULL
+);
+`);
+
+// ================== BOT INIT ==================
 const bot = new TelegramBot(TOKEN);
 bot.setWebHook(`${URL}/webhook`);
 
-// === INIT EXPRESS ===
+// ================== EXPRESS INIT ==================
 const app = express();
 app.use(express.json());
 
-// === AWAITING CAPTION STORE ===
+// ================== AWAITING CAPTION STORE ==================
 const awaitingCaption = {}; // replyMessageId -> { chatId, fileMessage }
 
-// === POSTGRES CONNECTION ===
-const client = new Client({
-  connectionString: process.env.DATABASE_URL || "postgres://avnadmin:AVNS_KbOyO3XI_DJVvRApxSs@pg-28d6d267-cremimedia2.j.aivencloud.com:21144/defaultdb?sslmode=require",
-});
-await client.connect();
-
-// === CREATE TABLE IF NOT EXISTS ===
-await client.query(`
-CREATE TABLE IF NOT EXISTS files (
-  id SERIAL PRIMARY KEY,
-  chat_id BIGINT NOT NULL,
-  message_id BIGINT NOT NULL,
-  caption TEXT NOT NULL,
-  file_type TEXT NOT NULL,
-  file_id TEXT NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW()
-)
-`);
-
-// === STORE MESSAGE FUNCTION ===
-const storeMessageDB = async (msg) => {
-  if (!msg?.message_id || !msg?.chat) return;
+// ================== STORE FILE FUNCTION ==================
+async function storeFile(msg, captionOverride) {
+  const caption = captionOverride || msg.caption || "untitled";
 
   const files = [];
   if (msg.document) files.push({ type: "document", file_id: msg.document.file_id, name: msg.document.file_name });
   if (msg.video) files.push({ type: "video", file_id: msg.video.file_id, name: msg.video.file_name || "video" });
   if (msg.audio) files.push({ type: "audio", file_id: msg.audio.file_id, name: msg.audio.file_name || "audio" });
 
-  const caption = msg.caption || msg.text || "";
-
   for (const file of files) {
-    await client.query(
-      `INSERT INTO files (chat_id, message_id, caption, file_type, file_id)
-       VALUES ($1,$2,$3,$4,$5)
-       ON CONFLICT (chat_id,message_id,file_id) DO NOTHING`,
+    await pool.query(
+      "INSERT INTO files(chat_id, message_id, caption, file_type, file_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
       [msg.chat.id, msg.message_id, caption, file.type, file.file_id]
     );
   }
 
   console.log(`📥 Indexed message: ${msg.message_id} - "${caption}"`);
-};
+  return files;
+}
 
-// === WEBHOOK HANDLER ===
+// ================== WEBHOOK ==================
 app.post("/webhook", (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
-// === WELCOME MESSAGE ===
+// ================== START MESSAGE ==================
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    "🎉 WELCOME TO SHAREGRACE MEDIA BOT!\n\nSend audio/video files or search the storage."
-  );
+  bot.sendMessage(msg.chat.id, "🎉 WELCOME TO SHAREGRACE MEDIA BOT!\nSend audio/video files or search the storage.");
 });
 
-// ==========================================================
-// 1️⃣ GROUP MEDIA HANDLER
-// ==========================================================
+// ================== MAIN MESSAGE HANDLER ==================
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
 
   // Ignore commands
   if (msg.text && msg.text.startsWith("/")) return;
 
-  // Handle replies to bot asking for captions
+  // Handle replies to caption prompt
   if (msg.reply_to_message && awaitingCaption[msg.reply_to_message.message_id]) {
     const { fileMessage } = awaitingCaption[msg.reply_to_message.message_id];
     const caption = msg.text.trim();
-    if (!caption) return bot.sendMessage(chatId, "❌ Caption cannot be empty.");
+    if (!caption) return bot.sendMessage(chatId, "❌ Caption cannot be empty. Send a valid caption.");
 
-    await storeMessageDB({ ...fileMessage, caption });
+    await storeFile(fileMessage, caption);
     delete awaitingCaption[msg.reply_to_message.message_id];
 
-    await bot.sendMessage(chatId, `✅ "${caption}" saved ✔️`);
-
     // Forward to storage channel
-    for (const file of fileMessage.document ? [{ type: "document", file: fileMessage.document }] :
-      fileMessage.video ? [{ type: "video", file: fileMessage.video }] :
-      fileMessage.audio ? [{ type: "audio", file: fileMessage.audio }] : []) {
+    if (fileMessage.document) await bot.sendDocument(CHANNEL_ID, fileMessage.document.file_id, { caption });
+    if (fileMessage.video) await bot.sendVideo(CHANNEL_ID, fileMessage.video.file_id, { caption });
+    if (fileMessage.audio) await bot.sendAudio(CHANNEL_ID, fileMessage.audio.file_id, { caption });
 
-      if (file.type === "document") await bot.sendDocument(CHANNEL_ID, file.file_id, { caption });
-      if (file.type === "video") await bot.sendVideo(CHANNEL_ID, file.file_id, { caption });
-      if (file.type === "audio") await bot.sendAudio(CHANNEL_ID, file.file_id, { caption });
-    }
-    return;
+    return bot.sendMessage(chatId, `✅ "${caption}" saved ✔️`);
   }
 
-  // Only handle group messages
+  // ================== GROUP FILE HANDLER ==================
   if (msg.chat.type.includes("group") && chatId !== CHANNEL_ID) {
     if (msg.document || msg.video || msg.audio) {
       if (!msg.caption) {
-        const prompt = await bot.sendMessage(chatId, "📌 Please send a caption for this file.");
+        const prompt = await bot.sendMessage(chatId, "📌 Please send a caption for this file so it can be saved.");
         awaitingCaption[prompt.message_id] = { chatId, fileMessage: msg };
         return;
       } else {
-        await storeMessageDB(msg);
+        await storeFile(msg);
 
         // Forward to storage channel
-        for (const file of msg.document ? [{ type: "document", file: msg.document }] :
-          msg.video ? [{ type: "video", file: msg.video }] :
-          msg.audio ? [{ type: "audio", file: msg.audio }] : []) {
+        if (msg.document) await bot.sendDocument(CHANNEL_ID, msg.document.file_id, { caption: msg.caption });
+        if (msg.video) await bot.sendVideo(CHANNEL_ID, msg.video.file_id, { caption: msg.caption });
+        if (msg.audio) await bot.sendAudio(CHANNEL_ID, msg.audio.file_id, { caption: msg.caption });
 
-          if (file.type === "document") await bot.sendDocument(CHANNEL_ID, file.file_id, { caption: msg.caption });
-          if (file.type === "video") await bot.sendVideo(CHANNEL_ID, file.file_id, { caption: msg.caption });
-          if (file.type === "audio") await bot.sendAudio(CHANNEL_ID, file.file_id, { caption: msg.caption });
-        }
-
-        console.log(`📤 Forwarded & indexed file from group: ${msg.message_id}`);
-        return;
+        return console.log(`📤 Forwarded & indexed file from group: ${msg.message_id}`);
       }
     }
 
-    // Bot tagged on a reply
+    // Bot tagged to a reply
     if (msg.reply_to_message && msg.entities?.some(e => e.type === "mention" && msg.text.includes("@CREMIMEDIA_Bot"))) {
       const target = msg.reply_to_message;
+      if (!target.document && !target.video && !target.audio)
+        return bot.sendMessage(chatId, `❌ File not recognized. Please retry.`);
 
-      if (target.document || target.video || target.audio) {
-        if (!target.caption) {
-          const prompt = await bot.sendMessage(chatId, "📌 Please send a caption for this file.");
-          awaitingCaption[prompt.message_id] = { chatId, fileMessage: target };
-        } else {
-          await storeMessageDB(target);
-
-          for (const file of target.document ? [{ type: "document", file: target.document }] :
-            target.video ? [{ type: "video", file: target.video }] :
-            target.audio ? [{ type: "audio", file: target.audio }] : []) {
-
-            if (file.type === "document") await bot.sendDocument(CHANNEL_ID, file.file_id, { caption: target.caption });
-            if (file.type === "video") await bot.sendVideo(CHANNEL_ID, file.file_id, { caption: target.caption });
-            if (file.type === "audio") await bot.sendAudio(CHANNEL_ID, file.file_id, { caption: target.caption });
-          }
-
-          await bot.sendMessage(chatId, `✅ "${target.caption}" saved ✔️`);
-        }
+      if (!target.caption) {
+        const prompt = await bot.sendMessage(chatId, "📌 Please send a caption for this file so it can be saved.");
+        awaitingCaption[prompt.message_id] = { chatId, fileMessage: target };
       } else {
-        await bot.sendMessage(chatId, `❌ File not recognized. Please retry.`);
+        await storeFile(target);
+        if (target.document) await bot.sendDocument(CHANNEL_ID, target.document.file_id, { caption: target.caption });
+        if (target.video) await bot.sendVideo(CHANNEL_ID, target.video.file_id, { caption: target.caption });
+        if (target.audio) await bot.sendAudio(CHANNEL_ID, target.audio.file_id, { caption: target.caption });
+        bot.sendMessage(chatId, `✅ "${target.caption}" saved ✔️`);
       }
+
       return;
     }
   }
 
-  // ==========================================================
-  // PRIVATE CHAT: SEARCH & UPLOAD
-  // ==========================================================
+  // ================== PRIVATE CHAT: UPLOAD / SEARCH ==================
   if (msg.chat.type === "private") {
+    // Upload files
     const handleMedia = async (type, fileId, title) => {
       const sent = await bot[type](CHANNEL_ID, fileId, { caption: title });
-      await storeMessageDB(sent);
-      await bot.sendMessage(msg.chat.id, `✅ ${type.replace("send", "")} "${title}" uploaded!`);
+      await storeFile(sent);
+      bot.sendMessage(chatId, `✅ ${type.replace("send", "")} "${title}" uploaded!`);
     };
 
-    if (msg.document) return await handleMedia("sendDocument", msg.document.file_id, msg.document.file_name || "untitled");
-    if (msg.video) return await handleMedia("sendVideo", msg.video.file_id, msg.video.file_name || "untitled");
-    if (msg.audio) return await handleMedia("sendAudio", msg.audio.file_id, msg.audio.file_name || "untitled");
+    if (msg.document) return handleMedia("sendDocument", msg.document.file_id, msg.document.file_name || "untitled");
+    if (msg.video) return handleMedia("sendVideo", msg.video.file_id, msg.video.file_name || "untitled");
+    if (msg.audio) return handleMedia("sendAudio", msg.audio.file_id, msg.audio.file_name || "untitled");
 
-    // SEARCH
+    // Search files
     if (msg.text) {
       const query = msg.text.trim().toLowerCase();
 
-      const res = await client.query(
-        `SELECT * FROM files WHERE LOWER(caption) LIKE $1 ORDER BY created_at DESC LIMIT 50`,
+      const { rows } = await pool.query(
+        "SELECT * FROM files WHERE LOWER(caption) LIKE $1",
         [`%${query}%`]
       );
 
-      if (res.rows.length === 0) return bot.sendMessage(msg.chat.id, `❌ No files found matching "${msg.text}".`);
+      if (rows.length === 0) return bot.sendMessage(chatId, `❌ No files found matching "${msg.text}".`);
 
-      const keyboard = res.rows.map((r) => [{
+      const keyboard = rows.map((r) => [{
         text: r.caption.length > 50 ? r.caption.slice(0, 50) + "…" : r.caption,
         callback_data: `${r.chat_id}|${r.message_id}`
       }]);
 
-      bot.sendMessage(msg.chat.id, `🔎 Search results for "${msg.text}":`, {
-        reply_markup: { inline_keyboard: keyboard }
-      });
+      bot.sendMessage(chatId, `🔎 Search results for "${msg.text}":`, { reply_markup: { inline_keyboard: keyboard } });
     }
   }
 });
 
-// ==========================================================
-// INLINE CALLBACK HANDLER
-// ==========================================================
+// ================== CALLBACK HANDLER ==================
 bot.on("callback_query", async (cb) => {
   const chatId = cb.message.chat.id;
   const [sourceChat, messageId] = cb.data.split("|");
 
-  const res = await client.query(
-    `SELECT * FROM files WHERE chat_id=$1 AND message_id=$2`,
-    [sourceChat, messageId]
-  );
+  const { rows } = await pool.query("SELECT * FROM files WHERE chat_id=$1 AND message_id=$2", [sourceChat, messageId]);
+  if (rows.length === 0) return bot.sendMessage(chatId, "❌ File not found.");
 
-  if (res.rows.length === 0) return bot.sendMessage(chatId, "❌ File not found.");
-
-  for (const file of res.rows) {
+  for (const file of rows) {
     if (file.file_type === "document") await bot.sendDocument(chatId, file.file_id, { caption: file.caption });
     if (file.file_type === "video") await bot.sendVideo(chatId, file.file_id, { caption: file.caption });
     if (file.file_type === "audio") await bot.sendAudio(chatId, file.file_id, { caption: file.caption });
   }
 });
 
-// ==========================================================
-// START SERVER
-// ==========================================================
+// ================== START SERVER ==================
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 Webhook set: ${URL}/webhook`);
