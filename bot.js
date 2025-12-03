@@ -11,8 +11,8 @@ if (!TOKEN || !URL) {
   process.exit(1);
 }
 
-// === CHANNEL ID ===
-const CHANNEL_ID = -1003155277985; // Your storage channel
+// === STORAGE CHANNEL ID ===
+const CHANNEL_ID = -1003155277985;
 
 // === INIT BOT ===
 const bot = new TelegramBot(TOKEN);
@@ -23,26 +23,26 @@ const app = express();
 app.use(express.json());
 
 // === MESSAGE STORE ===
-const messageStore = {}; // messageId -> { chatId, messageId, caption, files }
+// messageId -> { chatId, messageId, caption, files }
+const messageStore = {};
 
 // === STORE MESSAGE FUNCTION ===
 const storeMessage = (msg) => {
   if (!msg?.message_id || !msg?.chat) return;
 
   const files = [];
-
-  if (msg.document)
-    files.push({ type: "document", file_id: msg.document.file_id, name: msg.document.file_name });
-
-  if (msg.video)
-    files.push({ type: "video", file_id: msg.video.file_id, name: msg.video.file_name || "video" });
-
-  if (msg.audio)
-    files.push({ type: "audio", file_id: msg.audio.file_id, name: msg.audio.file_name || "audio" });
+  if (msg.document) files.push({ type: "document", file_id: msg.document.file_id, name: msg.document.file_name });
+  if (msg.video) files.push({ type: "video", file_id: msg.video.file_id, name: msg.video.file_name || "video" });
+  if (msg.audio) files.push({ type: "audio", file_id: msg.audio.file_id, name: msg.audio.file_name || "audio" });
 
   const caption = msg.caption || msg.text || "";
 
-  messageStore[msg.message_id] = { chatId: msg.chat.id, messageId: msg.message_id, caption, files };
+  messageStore[msg.message_id] = {
+    chatId: msg.chat.id,
+    messageId: msg.message_id,
+    caption,
+    files,
+  };
 
   console.log(`📥 Indexed message: ${msg.message_id} - "${caption}"`);
 };
@@ -57,29 +57,31 @@ app.post("/webhook", (req, res) => {
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "🎉 WELCOME TO SHAREGRACE MEDIA BOT!\n\n"
-
+    "🎉 WELCOME TO SHAREGRACE MEDIA BOT!\n\nSend audio/video files or search the channel/group.\n\nYou can also *tag me on a file in the group* to save it!"
   );
 });
 
 // ==========================================================
-// 1️⃣ INDEX ALL MEDIA IN GROUP
+// 1️⃣ INDEX GROUP FILES AND TAGGING HANDLER
 // ==========================================================
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
 
-  // Ignore commands
+  // Ignore bot commands
   if (msg.text && msg.text.startsWith("/")) return;
 
-  // Only handle group messages
+  // -----------------------------
+  // ✅ Group messages
+  // -----------------------------
   if (msg.chat.type.includes("group") && chatId !== CHANNEL_ID) {
-    
-    // Auto-index media
+
+    // 1️⃣ Auto-index media
     if (msg.document || msg.video || msg.audio) {
       storeMessage(msg);
+      console.log("📥 Group file indexed:", msg.message_id);
     }
 
-    // Handle explicit tag @bot on a reply
+    // 2️⃣ Tag bot to save & forward a file
     if (
       msg.reply_to_message &&
       msg.entities?.some(e => e.type === "mention" && msg.text.includes("@CREMIMEDIA_Bot"))
@@ -87,82 +89,70 @@ bot.on("message", async (msg) => {
       const target = msg.reply_to_message;
 
       if (target.document || target.video || target.audio) {
-        // Forward to storage channel
-        for (const file of target.document ? [{ type: "document", file: target.document }] :
-                                           target.video ? [{ type: "video", file: target.video }] :
-                                           target.audio ? [{ type: "audio", file: target.audio }] : []) {
-          if (file.type === "document")
-            await bot.sendDocument(CHANNEL_ID, file.file_id, { caption: file.file_name });
-          if (file.type === "video")
-            await bot.sendVideo(CHANNEL_ID, file.file_id, { caption: file.file_name || "video" });
-          if (file.type === "audio")
-            await bot.sendAudio(CHANNEL_ID, file.file_id, { caption: file.file_name || "audio" });
-        }
+        try {
+          if (target.document) await bot.sendDocument(CHANNEL_ID, target.document.file_id, { caption: target.document.file_name });
+          if (target.video) await bot.sendVideo(CHANNEL_ID, target.video.file_id, { caption: target.video.file_name || "video" });
+          if (target.audio) await bot.sendAudio(CHANNEL_ID, target.audio.file_id, { caption: target.audio.file_name || "audio" });
 
-        await bot.sendMessage(
-          chatId,
-          `✅ "${target.caption || target.document?.file_name || "untitled"}" saved ✔️`
-        );
-        storeMessage(target); // Index it after forwarding
+          storeMessage(target);
+
+          await bot.sendMessage(chatId, `✅ "${target.caption || target.document?.file_name || "untitled"}" saved ✔️`);
+          console.log(`📤 Forwarded & indexed file from group: ${target.message_id}`);
+        } catch (err) {
+          console.error("❌ Error forwarding file:", err);
+          await bot.sendMessage(chatId, `❌ Failed to save file. Please retry.`);
+        }
       } else {
-        await bot.sendMessage(chatId, `❌ File not recognized. Please retry.`);
+        await bot.sendMessage(chatId, `❌ File not recognized. Please reply to a valid media file.`);
       }
     }
 
-    return; // Do nothing else in the group
+    return; // Stop processing further for group
   }
 
-  // ==========================================================
-  // 2️⃣ PRIVATE CHAT: SEARCH & UPLOAD
-  // ==========================================================
-  if (chatId !== CHANNEL_ID && msg.chat.type === "private") {
+  // -----------------------------
+  // ✅ Private chat: upload/search
+  // -----------------------------
+  if (msg.chat.type === "private") {
 
-    // Handle media uploads → forward to storage channel
+    // 1️⃣ Forward uploaded media to storage channel
     const handleMedia = async (type, fileId, title) => {
       const sent = await bot[type](CHANNEL_ID, fileId, { caption: title });
       storeMessage(sent);
 
-      await bot.sendMessage(chatId, `✅ ${type.replace("send", "")} "${title}" uploaded to the channel!`);
+      await bot.sendMessage(msg.chat.id, `✅ ${type.replace("send", "")} "${title}" uploaded to the channel!`);
     };
 
     if (msg.document) return await handleMedia("sendDocument", msg.document.file_id, msg.document.file_name || "untitled");
     if (msg.video) return await handleMedia("sendVideo", msg.video.file_id, msg.video.file_name || "untitled");
     if (msg.audio) return await handleMedia("sendAudio", msg.audio.file_id, msg.audio.file_name || "untitled");
 
-// PRIVATE CHAT SEARCH FUNCTION
-if (msg.text) {
-  const query = msg.text.trim().toLowerCase();
+    // 2️⃣ Search in private chat (partial match)
+    if (msg.text) {
+      const query = msg.text.trim().toLowerCase();
 
-  const results = Object.values(messageStore).filter((m) => {
-    // Split caption into words, remove punctuation
-    const words = (m.caption || "")
-      .toLowerCase()
-      .replace(/[^\w\s]/g, "")
-      .split(/\s+/);
-    return words.includes(query); // Match whole word
-  });
+      const results = Object.values(messageStore).filter((m) => {
+        const caption = m.caption.toLowerCase();
+        return caption.includes(query); // Partial match anywhere in the caption
+      });
 
-  if (results.length === 0) {
-    return bot.sendMessage(chatId, `❌ No files found matching "${msg.text}".`);
-  }
+      if (results.length === 0) {
+        return bot.sendMessage(chatId, `❌ No files found matching "${msg.text}".`);
+      }
 
-  const keyboard = results.map((m) => [
-    {
-      text: m.caption.length > 50 ? m.caption.slice(0, 50) + "…" : m.caption,
-      callback_data: `${m.chatId}|${m.messageId}`,
-    },
-  ]);
+      const keyboard = results.map((m) => [
+        { text: m.caption.length > 50 ? m.caption.slice(0, 50) + "…" : m.caption, callback_data: `${m.chatId}|${m.messageId}` },
+      ]);
 
-  bot.sendMessage(chatId, `🔎 Search results for "${msg.text}":`, {
-    reply_markup: { inline_keyboard: keyboard },
-  });
-}
-
+      return bot.sendMessage(chatId, `🔎 Search results for "${msg.text}":`, {
+        reply_markup: { inline_keyboard: keyboard },
+      });
+    }
   }
 });
 
 // ==========================================================
-// 3️⃣ INLINE CALLBACK HANDLER
+// 2️⃣ INLINE CALLBACK HANDLER
 // ==========================================================
 bot.on("callback_query", async (cb) => {
   const chatId = cb.message.chat.id;
@@ -171,7 +161,6 @@ bot.on("callback_query", async (cb) => {
 
   if (!msg) return bot.sendMessage(chatId, "❌ Message not found or not indexed.");
 
-  // Send all files
   for (const file of msg.files) {
     if (file.type === "document") await bot.sendDocument(chatId, file.file_id, { caption: file.name });
     if (file.type === "video") await bot.sendVideo(chatId, file.file_id, { caption: file.name });
@@ -182,7 +171,7 @@ bot.on("callback_query", async (cb) => {
 });
 
 // ==========================================================
-// 4️⃣ START SERVER
+// 3️⃣ START SERVER
 // ==========================================================
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
