@@ -294,16 +294,113 @@ bot.on("callback_query", async (cb) => {
   const data = cb.data || "";
   const parts = data.split("|");
   const action = parts[0];
+  const chatId = cb.message?.chat?.id;
 
   try {
-    // Handle classification, publish, get, admin
-    // ... The callback code can largely remain as you wrote, with added safety checks
-    // I can rewrite this fully too if you want
+    // ================= CLASSIFICATION =================
+    if (action === "class") {
+      const type = parts[1]; // "edited" or "unedited"
+      const fileId = parseInt(parts[2], 10);
+      if (!fileId) return;
+
+      const updated = await updateFile(fileId, { edited: type === "edited" });
+      await bot.answerCallbackQuery(cb.id, { text: `Marked as ${type}` });
+      await bot.sendMessage(chatId, `✅ File "${updated.caption}" marked as ${type}`);
+      return;
+    }
+
+    // ================= PUBLISH =================
+    if (action === "publish") {
+      const choice = parts[1]; // "yes" or "no"
+      const fileId = parseInt(parts[2], 10);
+      if (!fileId) return;
+
+      const updated = await updateFile(fileId, { published: choice === "yes" });
+      await bot.answerCallbackQuery(cb.id, { text: `Set published = ${choice}` });
+      await bot.sendMessage(chatId, `✅ File "${updated.caption}" published status updated.`);
+      return;
+    }
+
+    // ================= GET FILE =================
+    if (action === "get") {
+      const fileId = parseInt(parts[1], 10);
+      if (!fileId) return;
+
+      const rows = await pool.query("SELECT * FROM files WHERE id = $1", [fileId]);
+      if (!rows.rows.length) {
+        await bot.answerCallbackQuery(cb.id, { text: "File not found." });
+        return;
+      }
+
+      const file = rows.rows[0];
+
+      await bot.answerCallbackQuery(cb.id);
+      if (file.file_type === "document") {
+        await bot.sendDocument(chatId, file.file_id, { caption: file.caption });
+      } else if (file.file_type === "video") {
+        await bot.sendVideo(chatId, file.file_id, { caption: file.caption });
+      } else if (file.file_type === "audio") {
+        await bot.sendAudio(chatId, file.file_id, { caption: file.caption });
+      }
+      return;
+    }
+
+    // ================= ADMIN ACTIONS =================
+    if (action === "admin") {
+      const subAction = parts[1]; // editname | togglepublished | togglevisible | delete
+      const fileId = parseInt(parts[2], 10);
+      if (!fileId) return;
+
+      const rows = await pool.query("SELECT * FROM files WHERE id = $1", [fileId]);
+      if (!rows.rows.length) {
+        await bot.answerCallbackQuery(cb.id, { text: "File not found." });
+        return;
+      }
+      const file = rows.rows[0];
+
+      switch (subAction) {
+        case "editname": {
+          const prompt = await bot.sendMessage(chatId, `✏️ Reply with new filename for "${file.caption}":`);
+          awaitingFilename.set(prompt.message_id, { fileRowId: file.id });
+          await bot.answerCallbackQuery(cb.id);
+          break;
+        }
+
+        case "togglepublished": {
+          const updated = await updateFile(file.id, { published: !file.published });
+          await bot.answerCallbackQuery(cb.id, { text: `Published set to ${updated.published}` });
+          await sendAdminFileActions(chatId, updated);
+          break;
+        }
+
+        case "togglevisible": {
+          const updated = await updateFile(file.id, { visible: !file.visible });
+          await bot.answerCallbackQuery(cb.id, { text: `Visible set to ${updated.visible}` });
+          await sendAdminFileActions(chatId, updated);
+          break;
+        }
+
+        case "delete": {
+          await pool.query("DELETE FROM files WHERE id = $1", [file.id]);
+          await bot.answerCallbackQuery(cb.id, { text: "File deleted from DB" });
+          await bot.sendMessage(chatId, `🗑️ File "${file.caption}" deleted from database.`);
+          break;
+        }
+
+        default:
+          await bot.answerCallbackQuery(cb.id, { text: "Unknown admin action" });
+      }
+      return;
+    }
+
+    // ================= UNKNOWN ACTION =================
+    await bot.answerCallbackQuery(cb.id, { text: "Unknown action." });
   } catch (err) {
     console.error("Callback error:", err, "data:", data);
     try { await bot.answerCallbackQuery(cb.id, { text: "An error occurred." }); } catch {}
   }
 });
+
 
 // ================== START SERVER ==================
 app.listen(PORT, () => {
