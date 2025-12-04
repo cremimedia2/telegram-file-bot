@@ -9,11 +9,11 @@ const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const URL = process.env.APP_URL;
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
-// CHANNEL_ID is your storage channel - files always forwarded here
+// CHANNEL_ID is your storage channel - files ALWAYS forwarded here
 const CHANNEL_ID = process.env.CHANNEL_ID ? parseInt(process.env.CHANNEL_ID, 10) : -1003155277985;
 
 // =============== EDIT THESE GROUP IDS AS NEEDED ===============
-// (you provided these — change them here if you move groups)
+// Keep them as you provided — change here if you move groups.
 const GROUPS = {
   // 1. Edited Sermon Video Group:
   EDITED_SERMON_VIDEO: -4744650276,
@@ -50,7 +50,7 @@ const pool = new Pool({
     await pool.query("SELECT 1");
     console.log("✅ Connected to Postgres");
 
-    // ensure base table exists
+    // ensure base table exists (with category, upload_date, publish_date columns)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS files (
         id SERIAL PRIMARY KEY,
@@ -65,15 +65,15 @@ const pool = new Pool({
         published BOOLEAN DEFAULT false,
         visible BOOLEAN DEFAULT true,
         uploaded_by BIGINT,
-        category TEXT,            -- e.g. "sermon" or "prophecy"
-        upload_date TIMESTAMP,    -- optional: when file was uploaded (user input)
-        publish_date TIMESTAMP,   -- optional: when to publish
+        category TEXT,
+        upload_date TIMESTAMP,
+        publish_date TIMESTAMP,
         created_at TIMESTAMP DEFAULT NOW(),
         UNIQUE(chat_id, message_id, file_id)
       );
     `);
 
-    // in case table existed previously without some columns, add them if missing
+    // ensure columns exist (safe to run multiple times)
     await pool.query(`ALTER TABLE files ADD COLUMN IF NOT EXISTS category TEXT;`);
     await pool.query(`ALTER TABLE files ADD COLUMN IF NOT EXISTS upload_date TIMESTAMP;`);
     await pool.query(`ALTER TABLE files ADD COLUMN IF NOT EXISTS publish_date TIMESTAMP;`);
@@ -95,9 +95,11 @@ app.use(express.json());
 
 // ================== HELPER MAPS ==================
 // awaitingCaption: promptMessageId -> { originalMessage, promptChatId }
-// awaitingFilename: promptMessageId -> { fileRowId }
+// awaitingReply: promptMessageId -> { type: 'editname'|'publishSchedule'|'uploadDate', fileId, extra... }
 const awaitingCaption = new Map();
-const awaitingFilename = new Map();
+const awaitingReply = new Map(); // generic replies for several flows
+// temporary in-memory store for partial upload date selections: fileId -> { day, month }
+const awaitingUploadDate = new Map();
 
 // ================== HELPERS ==================
 const isAdmin = (userId) => {
@@ -159,6 +161,12 @@ const fetchFile = async (id) => {
   return res.rows[0] ?? null;
 };
 
+const findFileByMessage = async (chatId, messageId, fileId) => {
+  // Helpful when admin replies to a message in a chat and you want the db row
+  const res = await pool.query("SELECT * FROM files WHERE chat_id = $1 AND message_id = $2 AND file_id = $3 LIMIT 1", [chatId, messageId, fileId]);
+  return res.rows[0] ?? null;
+};
+
 const searchFiles = async (queryText, requesterIsAdmin) => {
   const q = `%${queryText}%`;
   const sql = requesterIsAdmin
@@ -169,13 +177,8 @@ const searchFiles = async (queryText, requesterIsAdmin) => {
 };
 
 // ================== INLINE KEYBOARDS & FLOWS ==================
-
-// After saving, we'll prompt for category and edited state (as inline buttons).
-// These helper functions send inline buttons (answers are in callbacks).
-
+// Category keyboard (user clicks one)
 const sendCategoryKeyboard = async (chatId, fileRow) => {
-  // For video/audio we present category options (sermon/prophecy).
-  // You can change options here or add more categories.
   const keyboard = {
     reply_markup: {
       inline_keyboard: [
@@ -189,6 +192,7 @@ const sendCategoryKeyboard = async (chatId, fileRow) => {
   await bot.sendMessage(chatId, `Which category is "${fileRow.caption}"?`, keyboard);
 };
 
+// Edited / Unedited keyboard
 const sendEditedKeyboard = async (chatId, fileRow) => {
   const keyboard = {
     reply_markup: {
@@ -203,13 +207,14 @@ const sendEditedKeyboard = async (chatId, fileRow) => {
   await bot.sendMessage(chatId, `Is "${fileRow.caption}" edited or unedited?`, keyboard);
 };
 
+// Publish keyboard (admin option)
 const sendPublishedKeyboard = async (chatId, fileRow) => {
   const keyboard = {
     reply_markup: {
       inline_keyboard: [
         [
           { text: "Publish now", callback_data: `publish|now|${fileRow.id}` },
-          { text: "Schedule (ask date)", callback_data: `publish|schedule|${fileRow.id}` }
+          { text: "Schedule (pick date)", callback_data: `publish|schedule|${fileRow.id}` }
         ]
       ]
     }
@@ -217,26 +222,72 @@ const sendPublishedKeyboard = async (chatId, fileRow) => {
   await bot.sendMessage(chatId, `When should "${fileRow.caption}" be published?`, keyboard);
 };
 
-// Admin action menu (keeps previous behaviour)
+// Admin action menu (Edit this file -> admin actions shown)
 const sendAdminFileActions = async (chatId, fileRow) => {
   const buttons = [
-    [{ text: "Edit file name", callback_data: `admin|editname|${fileRow.id}` }],
+    [{ text: "Edit caption", callback_data: `admin|editname|${fileRow.id}` }],
     [{ text: fileRow.edited ? (fileRow.published ? "Mark Unpublished" : "Mark Published") : "Mark Published (edited only)", callback_data: `admin|togglepublished|${fileRow.id}` }],
     [{ text: fileRow.visible ? "Hide from users" : "Unhide (visible)", callback_data: `admin|togglevisible|${fileRow.id}` }],
+    [{ text: "Set publish date", callback_data: `admin|setpublishdate|${fileRow.id}` }],
+    [{ text: "Set upload date", callback_data: `admin|setuploaddate|${fileRow.id}` }],
     [{ text: "Delete (DB only)", callback_data: `admin|delete|${fileRow.id}` }]
   ];
   await bot.sendMessage(chatId,
     `File details:\n\nTitle: ${fileRow.caption}\nType: ${fileRow.file_type}\nCategory: ${fileRow.category || "(not set)"}\nEdited: ${fileRow.edited}\nPublished: ${fileRow.published}\nVisible: ${fileRow.visible}\nFilename: ${fileRow.real_filename || "(none)"}\nUploaded by: ${fileRow.uploaded_by}\nStored id: ${fileRow.id}`,
-    { reply_markup: { inline_keyboard: buttons } }
+    { reply_markup: { inline_keyboard: buttons }, parse_mode: "Markdown" }
   );
 };
 
-// ================== FORWARDING LOGIC ==================
+// Upload-date inline flows (Day -> Month -> Year)
+const sendDayKeyboard = async (chatId, fileId) => {
+  // many buttons — arrange in rows of 7 for readability
+  const rows = [];
+  let row = [];
+  for (let d = 1; d <= 31; d++) {
+    row.push({ text: String(d), callback_data: `uday|${d}|${fileId}` });
+    if (row.length === 7) {
+      rows.push(row);
+      row = [];
+    }
+  }
+  if (row.length) rows.push(row);
 
-// Decide which group to forward to based on file type, category and edited flag.
-// Adjust mapping above in GROUPS if you want different targets.
+  await bot.sendMessage(chatId, "Select upload DAY (1-31):", { reply_markup: { inline_keyboard: rows } });
+};
+
+const MONTHS = [
+  ["Jan","1"],["Feb","2"],["Mar","3"],["Apr","4"],["May","5"],["Jun","6"],
+  ["Jul","7"],["Aug","8"],["Sep","9"],["Oct","10"],["Nov","11"],["Dec","12"]
+];
+
+const sendMonthKeyboard = async (chatId, fileId) => {
+  const rows = [];
+  let row = [];
+  for (const [label, val] of MONTHS) {
+    row.push({ text: label, callback_data: `umonth|${val}|${fileId}` });
+    if (row.length === 4) { rows.push(row); row = []; }
+  }
+  if (row.length) rows.push(row);
+  await bot.sendMessage(chatId, "Select upload MONTH:", { reply_markup: { inline_keyboard: rows } });
+};
+
+const sendYearKeyboard = async (chatId, fileId) => {
+  // customize the range if needed
+  const start = 2000;
+  const end = 2035;
+  const rows = [];
+  let row = [];
+  for (let y = start; y <= end; y++) {
+    row.push({ text: String(y), callback_data: `uyear|${y}|${fileId}` });
+    if (row.length === 5) { rows.push(row); row = []; }
+  }
+  if (row.length) rows.push(row);
+  await bot.sendMessage(chatId, "Select upload YEAR:", { reply_markup: { inline_keyboard: rows } });
+};
+
+// ================== FORWARDING LOGIC ==================
+// Decide which group to forward to based on file type, category and edited flag
 const determineTargetGroup = (fileRow) => {
-  // fileRow: an object from DB containing file_type, category, edited, etc.
   const type = fileRow.file_type; // "video" | "audio" | "document"
   const cat = (fileRow.category || "").toLowerCase();
 
@@ -248,11 +299,7 @@ const determineTargetGroup = (fileRow) => {
   }
 
   if (type === "audio") {
-    // using category if provided, otherwise default to sermon audio group
-    if (cat === "prophecy") {
-      // if you had a prophecy audio group, you would route there; currently using sermon audio group
-      return GROUPS.SERMON_AUDIO_GROUP;
-    }
+    // audio routing currently goes to SERMON_AUDIO_GROUP by default
     return GROUPS.SERMON_AUDIO_GROUP;
   }
 
@@ -261,26 +308,12 @@ const determineTargetGroup = (fileRow) => {
 };
 
 const forwardToGroups = async (fileRow) => {
-  // Always forward to STORAGE channel
-  try {
-    if (fileRow.file_type === "document") {
-      await bot.sendDocument(GROUPS.STORAGE_CHANNEL, fileRow.file_id, { caption: fileRow.caption });
-    } else if (fileRow.file_type === "video") {
-      await bot.sendVideo(GROUPS.STORAGE_CHANNEL, fileRow.file_id, { caption: fileRow.caption });
-    } else if (fileRow.file_type === "audio") {
-      await bot.sendAudio(GROUPS.STORAGE_CHANNEL, fileRow.file_id, { caption: fileRow.caption });
-    } else {
-      // unknown type: just send caption note
-      await bot.sendMessage(GROUPS.STORAGE_CHANNEL, `Saved file: ${fileRow.caption}`);
-    }
-  } catch (err) {
-    console.error("Failed to forward to storage channel:", err);
-  }
-
-  // Determine a single target group (if any) and forward there as well
+  // ALWAYS forward to STORAGE channel immediately when we first save the file
+  // (this function will be used to forward to the target group later,
+  //  but storage forwarding is already performed when saving.)
   const targetGroup = determineTargetGroup(fileRow);
   if (!targetGroup) {
-    console.log("No group determined for file id", fileRow.id, "- not forwarding to groups.");
+    console.log("No group determined for file id", fileRow.id, "- not forwarding to additional group.");
     return;
   }
 
@@ -291,6 +324,8 @@ const forwardToGroups = async (fileRow) => {
       await bot.sendVideo(targetGroup, fileRow.file_id, { caption: fileRow.caption });
     } else if (fileRow.file_type === "audio") {
       await bot.sendAudio(targetGroup, fileRow.file_id, { caption: fileRow.caption });
+    } else {
+      await bot.sendMessage(targetGroup, `Saved file: ${fileRow.caption}`);
     }
     console.log(`Forwarded file id ${fileRow.id} to group ${targetGroup}`);
   } catch (err) {
@@ -317,15 +352,12 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id, welcome);
 });
 
-// Small helper to show group id when bot added in groups (handy to get IDs)
-// It will respond with group ID when it sees a message in a group.
-// Keep or remove as you like.
+// Helpful: show group id when bot sees a group (commented out sending — avoid spam)
 bot.on("message", (msg) => {
   try {
     if (msg.chat && (msg.chat.type === "group" || msg.chat.type === "supergroup")) {
       console.log("GROUP ID:", msg.chat.id);
-      // DON'T spam the group; only send on admin request.
-      // If you'd like the bot to announce the group ID, uncomment the next line:
+      // If you want the bot to announce group id, uncomment:
       // bot.sendMessage(msg.chat.id, `🆔 Group ID: ${msg.chat.id}`);
     }
   } catch (err) {
@@ -342,31 +374,56 @@ bot.on("message", async (msg) => {
     // ignore commands here (start handled above)
     if (msg.text?.startsWith("/")) return;
 
-    // === Replies to caption / filename prompts ===
+    // === If admin replies to an existing file message in-group: show full details + "Edit this file?" button ===
+    if (msg.reply_to_message && isAdmin(requesterId)) {
+      const replied = msg.reply_to_message;
+      const fileCandidate = replied.document || replied.video || replied.audio;
+      if (fileCandidate) {
+        // Try to find DB row matching that original message (chat + message + file_id)
+        const dbRow = await findFileByMessage(replied.chat.id, replied.message_id, fileCandidate.file_id);
+        if (dbRow) {
+          // send file details and an "Edit this file?" inline button (admins only)
+          const keyboard = {
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: "Edit this file?", callback_data: `admin|openedit|${dbRow.id}` }]
+              ]
+            }
+          };
+          await bot.sendMessage(chatId, `File found in DB:\n\nTitle: ${dbRow.caption}\nType: ${dbRow.file_type}\nCategory: ${dbRow.category || "(not set)"}\nEdited: ${dbRow.edited}\nPublished: ${dbRow.published}\nVisible: ${dbRow.visible}\nFilename: ${dbRow.real_filename || "(none)"}\nUploaded by: ${dbRow.uploaded_by}\nStored id: ${dbRow.id}`, keyboard);
+          // stop further processing for this message (admin reply handled)
+          return;
+        }
+      }
+    }
+
+    // === Replies to prompts (caption prompt + generic awaitingReply flows) ===
     if (msg.reply_to_message) {
       const replyId = msg.reply_to_message.message_id;
 
-      // caption flow
+      // Caption flow (when we asked for caption)
       if (awaitingCaption.has(replyId)) {
-        const original = awaitingCaption.get(replyId); // { originalMessage, promptChatId }
+        const original = awaitingCaption.get(replyId);
         const captionText = (msg.text || "").trim();
         if (!captionText) return bot.sendMessage(chatId, "❌ Caption cannot be empty. Please send a valid caption.");
 
         try {
+          // Insert into DB and forward to storage channel immediately (storage always gets a copy)
           const inserted = await insertFileRow({ msg: original.originalMessage, captionOverride: captionText, uploadedBy: requesterId });
           awaitingCaption.delete(replyId);
 
-          // forward to storage channel
+          // Forward to storage channel (only once)
           if (original.originalMessage.document) await bot.sendDocument(GROUPS.STORAGE_CHANNEL, original.originalMessage.document.file_id, { caption: captionText });
           if (original.originalMessage.video) await bot.sendVideo(GROUPS.STORAGE_CHANNEL, original.originalMessage.video.file_id, { caption: captionText });
           if (original.originalMessage.audio) await bot.sendAudio(GROUPS.STORAGE_CHANNEL, original.originalMessage.audio.file_id, { caption: captionText });
 
           await bot.sendMessage(chatId, `✅ "${captionText}" saved ✔️`);
 
-          // Send inline question flow (category + edited). These calls send inline keyboards.
+          // Start sequential inline question flow: Category -> Edited -> Upload date...
+          // Ask CATEGORY first:
           await sendCategoryKeyboard(chatId, inserted);
-          await sendEditedKeyboard(chatId, inserted);
 
+          // Note: do NOT call sendEditedKeyboard or forward yet. We'll prompt next after category callback.
           console.log("Indexed with caption (reply flow):", inserted.id);
         } catch (err) {
           console.error("Caption reply insert failed:", err);
@@ -375,23 +432,47 @@ bot.on("message", async (msg) => {
         return;
       }
 
-      // filename flow
-      if (awaitingFilename.has(replyId)) {
-        const record = awaitingFilename.get(replyId);
-        const fileRowId = record.fileRowId;
-        const newName = (msg.text || "").trim();
-        if (!newName) return bot.sendMessage(chatId, "❌ Filename cannot be empty.");
-
-        try {
-          const updated = await updateFile(fileRowId, { real_filename: newName, caption: newName });
-          awaitingFilename.delete(replyId);
-          await bot.sendMessage(chatId, `✅ Filename saved: "${newName}"`);
-          await sendAdminFileActions(chatId, updated);
-        } catch (err) {
-          console.error("DB update error (filename reply):", err);
-          return bot.sendMessage(chatId, "❌ Failed to update filename. Try again.");
+      // Generic awaitingReply flows (edit name, publish schedule input, etc.)
+      if (awaitingReply.has(replyId)) {
+        const payload = awaitingReply.get(replyId);
+        // Edit filename reply
+        if (payload.type === "editname" && payload.fileId) {
+          const newName = (msg.text || "").trim();
+          if (!newName) return bot.sendMessage(chatId, "❌ Filename cannot be empty.");
+          try {
+            const updated = await updateFile(payload.fileId, { real_filename: newName, caption: newName });
+            awaitingReply.delete(replyId);
+            await bot.sendMessage(chatId, `✅ Filename updated: "${newName}"`);
+            await sendAdminFileActions(chatId, updated);
+          } catch (err) {
+            console.error("Filename reply update failed:", err);
+            return bot.sendMessage(chatId, "❌ Failed to update filename.");
+          }
+          return;
         }
-        return;
+
+        // Publish schedule reply (admin enters "YYYY-MM-DD HH:MM" or we could ask sequentially — for simplicity accept ISO)
+        if (payload.type === "publishSchedule" && payload.fileId) {
+          const val = (msg.text || "").trim();
+          // try to parse as ISO datetime
+          const dt = new Date(val);
+          if (isNaN(dt.getTime())) {
+            return bot.sendMessage(chatId, "❌ Invalid date format. Use YYYY-MM-DD HH:MM (24h). Example: 2025-12-25 14:30");
+          }
+          try {
+            const updated = await updateFile(payload.fileId, { publish_date: dt, published: false });
+            awaitingReply.delete(replyId);
+            await bot.sendMessage(chatId, `✅ Publish date set: ${dt.toISOString()}`);
+            await sendAdminFileActions(chatId, updated);
+          } catch (err) {
+            console.error("Publish schedule save failed:", err);
+            return bot.sendMessage(chatId, "❌ Failed to set publish date.");
+          }
+          return;
+        }
+
+        // Admin set upload date by free text (not used in main flow) - not implemented by default
+        // Add other awaitingReply types here as needed
       }
     }
 
@@ -406,25 +487,25 @@ bot.on("message", async (msg) => {
       // If no caption, ask for caption via reply flow
       if (!msg.caption) {
         const prompt = await bot.sendMessage(chatId, "📌 Please send a caption for this file so it can be saved. Reply to this message with the caption.");
+        // store original message for later insertion
         awaitingCaption.set(prompt.message_id, { originalMessage: msg, promptChatId: chatId });
         console.log("Awaiting caption for message", msg.message_id, "mapped to prompt", prompt.message_id);
         return;
       }
 
-      // If caption provided, insert immediately
+      // If caption provided, insert immediately and forward to storage channel (single copy)
       try {
         const inserted = await insertFileRow({ msg, captionOverride: msg.caption, uploadedBy: requesterId });
 
-        // Forward to storage channel
+        // Forward to storage channel (only once)
         if (msg.document) await bot.sendDocument(GROUPS.STORAGE_CHANNEL, msg.document.file_id, { caption: msg.caption });
         if (msg.video) await bot.sendVideo(GROUPS.STORAGE_CHANNEL, msg.video.file_id, { caption: msg.caption });
         if (msg.audio) await bot.sendAudio(GROUPS.STORAGE_CHANNEL, msg.audio.file_id, { caption: msg.caption });
 
         await bot.sendMessage(chatId, `✅ "${msg.caption}" saved ✔️`);
 
-        // Start the inline question flow (category + edited)
+        // Start the sequential inline question flow: ask CATEGORY now
         await sendCategoryKeyboard(chatId, inserted);
-        await sendEditedKeyboard(chatId, inserted);
 
         console.log("Admin upload indexed:", inserted.id);
       } catch (err) {
@@ -455,14 +536,14 @@ bot.on("callback_query", async (cb) => {
   const data = cb.data || "";
   const parts = data.split("|");
   const action = parts[0];
-  // sometimes cb.message is undefined (rare), so fallback to cb.from.id
+  // sometimes cb.message is undefined (rare), fallback to cb.from.id
   const chatId = cb.message?.chat?.id ?? cb.from.id;
 
   try {
     // ---------- CATEGORY ----------
     // cat|<category>|<fileId>
     if (action === "cat") {
-      const category = parts[1]; // e.g. "sermon" or "prophecy"
+      const category = parts[1];
       const fileId = parseInt(parts[2], 10);
       if (!fileId) {
         await bot.answerCallbackQuery(cb.id, { text: "Invalid file." });
@@ -473,17 +554,13 @@ bot.on("callback_query", async (cb) => {
       await bot.answerCallbackQuery(cb.id, { text: `Category set to ${category}` });
       await bot.sendMessage(chatId, `✅ "${updated.caption}" category set to *${category}*.`, { parse_mode: "Markdown" });
 
-      // After category is set, check if edited value exists; if both present, forward.
-      const fresh = await fetchFile(fileId);
-      if (fresh && typeof fresh.edited === "boolean") {
-        // we can forward automatically now
-        await forwardToGroups(fresh);
-      }
+      // After category set, ask Edited/Unedited next (sequential)
+      await sendEditedKeyboard(chatId, updated);
       return;
     }
 
     // ---------- CLASSIFICATION (edited/unedited) ----------
-    // class|edited|<fileId>  OR class|unedited|<fileId>
+    // class|edited|<fileId>
     if (action === "class") {
       const which = parts[1]; // "edited" or "unedited"
       const fileId = parseInt(parts[2], 10);
@@ -497,13 +574,74 @@ bot.on("callback_query", async (cb) => {
       await bot.answerCallbackQuery(cb.id, { text: `Marked as ${which}` });
       await bot.sendMessage(chatId, `✅ File "${updated.caption}" marked as *${which}*.`, { parse_mode: "Markdown" });
 
-      // After marking edited/unedited, try to forward if category exists
+      // After marking edited/unedited, ask for upload date sequentially:
+      // Day -> Month -> Year
+      // store nothing yet; use awaitingUploadDate map to collect day/month/year
+      awaitingUploadDate.set(fileId, {});
+
+      await sendDayKeyboard(chatId, fileId);
+      return;
+    }
+
+    // ---------- UPLOAD DATE: DAY ----------
+    // uday|<day>|<fileId>
+    if (action === "uday") {
+      const day = parseInt(parts[1], 10);
+      const fileId = parseInt(parts[2], 10);
+      if (!fileId || !day) { await bot.answerCallbackQuery(cb.id, { text: "Invalid selection." }); return; }
+
+      awaitingUploadDate.set(fileId, { day });
+      await bot.answerCallbackQuery(cb.id, { text: `Day selected: ${day}` });
+      await sendMonthKeyboard(chatId, fileId);
+      return;
+    }
+
+    // ---------- UPLOAD DATE: MONTH ----------
+    // umonth|<month>|<fileId>
+    if (action === "umonth") {
+      const month = parseInt(parts[1], 10); // 1..12
+      const fileId = parseInt(parts[2], 10);
+      if (!fileId || !month) { await bot.answerCallbackQuery(cb.id, { text: "Invalid selection." }); return; }
+
+      const state = awaitingUploadDate.get(fileId) || {};
+      state.month = month;
+      awaitingUploadDate.set(fileId, state);
+      await bot.answerCallbackQuery(cb.id, { text: `Month selected` });
+      await sendYearKeyboard(chatId, fileId);
+      return;
+    }
+
+    // ---------- UPLOAD DATE: YEAR ----------
+    // uyear|<year>|<fileId>
+    if (action === "uyear") {
+      const year = parseInt(parts[1], 10);
+      const fileId = parseInt(parts[2], 10);
+      if (!fileId || !year) { await bot.answerCallbackQuery(cb.id, { text: "Invalid selection." }); return; }
+
+      const state = awaitingUploadDate.get(fileId) || {};
+      if (!state.day || !state.month) {
+        // missing previous steps — ask day again
+        awaitingUploadDate.set(fileId, {}); // reset
+        await bot.answerCallbackQuery(cb.id, { text: "Please select day and month first." });
+        await sendDayKeyboard(chatId, fileId);
+        return;
+      }
+
+      // construct upload date (local midnight)
+      // Note: months in JS Date are 0-indexed
+      const dt = new Date(Date.UTC(year, state.month - 1, state.day, 0, 0, 0));
+      // Save upload_date to DB
+      const updated = await updateFile(fileId, { upload_date: dt });
+      awaitingUploadDate.delete(fileId);
+
+      await bot.answerCallbackQuery(cb.id, { text: `Upload date set: ${year}-${state.month}-${state.day}` });
+      await bot.sendMessage(chatId, `✅ "${updated.caption}" upload date set to ${year}-${state.month}-${state.day}.`);
+
+      // Now that we have category (should already exist), edited (set), and upload_date, forward to the determined group.
       const fresh = await fetchFile(fileId);
-      if (fresh && fresh.category) {
+      if (fresh) {
+        // Forward to target group (storage already has a copy)
         await forwardToGroups(fresh);
-      } else {
-        // if category not set yet, remind user to set category
-        await sendCategoryKeyboard(chatId, updated);
       }
       return;
     }
@@ -520,10 +658,9 @@ bot.on("callback_query", async (cb) => {
         await bot.answerCallbackQuery(cb.id, { text: "Published now." });
         await bot.sendMessage(chatId, `✅ "${updated.caption}" marked as published.`);
       } else if (choice === "schedule") {
-        // schedule flow: ask admin to reply with a date
-        const prompt = await bot.sendMessage(chatId, "📆 Reply to this message with the publish date/time (YYYY-MM-DD HH:MM) for scheduling.");
-        // We'll store mapping so the reply handler can interpret it (re-using awaitingFilename map)
-        awaitingFilename.set(prompt.message_id, { publishScheduleFor: fileId });
+        // schedule flow: ask admin to reply with a date/time (we accept "YYYY-MM-DD HH:MM")
+        const prompt = await bot.sendMessage(chatId, "📆 Reply to this message with the publish date/time (YYYY-MM-DD HH:MM).");
+        awaitingReply.set(prompt.message_id, { type: "publishSchedule", fileId });
         await bot.answerCallbackQuery(cb.id, { text: "Send publish date by replying to the prompt." });
       }
       return;
@@ -555,7 +692,7 @@ bot.on("callback_query", async (cb) => {
     }
 
     // ---------- ADMIN ACTIONS ----------
-    // admin|editname|id  OR admin|togglepublished|id etc.
+    // admin|openedit|id  OR admin|editname|id  etc.
     if (action === "admin") {
       // ensure only admins use admin actions
       if (!isAdmin(cb.from.id)) {
@@ -574,14 +711,27 @@ bot.on("callback_query", async (cb) => {
       }
 
       switch (sub) {
+        case "openedit": {
+          // open admin menu (Edit this file was clicked)
+          await bot.answerCallbackQuery(cb.id);
+          await sendAdminFileActions(chatId, file);
+          break;
+        }
+
         case "editname": {
-          const prompt = await bot.sendMessage(chatId, `✏️ Reply to this message with the new filename for "${file.caption}":`);
-          awaitingFilename.set(prompt.message_id, { fileRowId: file.id });
+          // ask admin to reply to this message with new filename
+          const prompt = await bot.sendMessage(chatId, `✏️ Reply to this message with the new caption/filename for "${file.caption}":`);
+          awaitingReply.set(prompt.message_id, { type: "editname", fileId: file.id });
           await bot.answerCallbackQuery(cb.id, { text: "Reply with new filename." });
           break;
         }
 
         case "togglepublished": {
+          // toggle only if file.edited === true (as your earlier logic desired)
+          if (!file.edited) {
+            await bot.answerCallbackQuery(cb.id, { text: "File not marked edited. Mark as edited first." });
+            return;
+          }
           const updated = await updateFile(file.id, { published: !file.published });
           await bot.answerCallbackQuery(cb.id, { text: `Published set to ${updated.published}` });
           await sendAdminFileActions(chatId, updated);
@@ -592,6 +742,21 @@ bot.on("callback_query", async (cb) => {
           const updated = await updateFile(file.id, { visible: !file.visible });
           await bot.answerCallbackQuery(cb.id, { text: `Visible set to ${updated.visible}` });
           await sendAdminFileActions(chatId, updated);
+          break;
+        }
+
+        case "setpublishdate": {
+          // Provide the publish keyboard
+          await bot.answerCallbackQuery(cb.id);
+          await sendPublishedKeyboard(chatId, file);
+          break;
+        }
+
+        case "setuploaddate": {
+          // Admin chooses upload date via same Day->Month->Year flow as regular flow
+          awaitingUploadDate.set(file.id, {});
+          await bot.answerCallbackQuery(cb.id);
+          await sendDayKeyboard(chatId, file.id);
           break;
         }
 
