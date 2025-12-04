@@ -197,6 +197,13 @@ bot.onText(/\/start/, (msg) => {
 });
 
 // ================== MESSAGE HANDLER ==================
+bot.on("message", (msg) => {
+  if (msg.chat.type.endsWith("group")) {
+    console.log("GROUP ID:", msg.chat.id);
+    bot.sendMessage(msg.chat.id, `🆔 Group ID: ${msg.chat.id}`);
+  }
+});
+
 bot.on("message", async (msg) => {
   const requesterId = msg.from?.id;
   const chatId = msg.chat.id;
